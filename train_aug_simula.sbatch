@@ -10,10 +10,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
+#SBATCH --gres=gpu:1
 #SBATCH --output=out/std/train/%j-%x-stdout.txt
 #SBATCH --error=out/err/train/%j-%x-stderr.txt
 
+module purge
+module load slurm/21.08.8
 # Source env
 source /global/D1/homes/tobiah/align/bin/activate
 
-python align_fine_tuning.py --batch_size 32 --accumulation_steps 1 --augmented --epochs 10000 --maximize --lr 0.00000001 --stop_patience 10000 --save --save_every 10000 --verbose --loss_func contrastive --split_name fold_0_aug_25 --validate --ignore_checkpoint --description word --slurm_job_id $SLURM_JOB_ID --slurm_job_desc "Testing augmented data sett on augmented datasett"
+srun python align_fine_tuning.py --batch_size 32 --accumulation_steps 1 --augmented --epochs 10000 --maximize --lr 0.00000001 --stop_patience 10000 --save --save_every 10000 --verbose --loss_func contrastive --split_name fold_1_aug_25 --validate --ignore_checkpoint --description word --slurm_job_id $SLURM_JOB_ID --slurm_job_desc "Testing augmented data sett on augmented datasett"

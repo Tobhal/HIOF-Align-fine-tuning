@@ -12,4 +12,4 @@
 # Source env
 source /global/D1/homes/tobiah/align/bin/activate
 
-python plot_loss.py --nums 1 --save_plot --split_name fold_0_aug
+python plot_loss.py --nums 1 --save_plot --split_name fold_0_aug_25
