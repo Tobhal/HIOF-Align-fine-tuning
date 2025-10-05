@@ -16,18 +16,20 @@ from tqdm import tqdm
 
 from parser import prepear_data_argparse
 
-def save_csv(data: list, folder: os.PathLike, file_name: str='data.csv'):
+
+def save_csv(data: list, folder: os.PathLike, file_name: str = 'data.csv'):
     with open(ospj(folder, file_name), 'w', newline='') as fp:
         writer = csv.writer(fp)
         writer.writerow(('Image', 'Word', 'Language'))
 
         # Sorting csv_data based on index and filename
         data.sort(key=lambda x: (int(x[0].split('/')[1]), x[0].split('/')[2]))
-        
+
         writer.writerows(data)
 
 
-def split_and_move_folder(input_folder: os.PathLike, output_folder: os.PathLike, class_file: os.PathLike, fold, percentage=0.2):
+def split_and_move_folder(input_folder: os.PathLike, output_folder: os.PathLike, class_file: os.PathLike, fold,
+                          percentage=0.2):
     """
     Move a percentage of classes from the input directory to the destination directory.
 
@@ -40,8 +42,8 @@ def split_and_move_folder(input_folder: os.PathLike, output_folder: os.PathLike,
     """
     dirs = [dir for dir in os.listdir(input_folder) if os.path.isdir(os.path.join(input_folder, dir))]
 
-    selected = random.sample(dirs, int(len(dirs)*percentage))
-    
+    selected = random.sample(dirs, int(len(dirs) * percentage))
+
     # Read the original text file
     with open(os.path.join(input_folder, class_file), 'r') as f:
         classes = f.read().splitlines()
@@ -89,7 +91,7 @@ def gen_data_csv(folder: os.PathLike, fold: str):
     # Get a list of all directory indices (as integers) present in the input_directory
     dir_indices = [int(dir_name) for dir_name in os.listdir(folder) if os.path.isdir(os.path.join(folder, dir_name))]
     dir_indices.sort()
-    
+
     # initialize all labels
     labels_dict = {}
     with open(os.path.join(folder, label_file), 'r') as f:
@@ -99,17 +101,17 @@ def gen_data_csv(folder: os.PathLike, fold: str):
     # Walk through all subdirectories of the root folder
     for root, dirs, files in os.walk(folder):
         d += 1
-        
+
         # Walk through all files in the current directory
         for file_name in files:
             fl += 1
-            
+
             # Check if the file is an image
             if file_name.endswith('.jpg') or file_name.endswith('.png'):
                 total_images += 1
                 new_image_path = os.path.join(root, file_name)
                 dir_index = os.path.basename(root)
-                
+
                 # Append the directory name to the file name to ensure uniqueness
                 new_file_name = ospj(phase, dir_index, file_name)
 
@@ -123,10 +125,10 @@ def gen_data_csv(folder: os.PathLike, fold: str):
 
 
 def rezie_images(
-        folder: os.PathLike, 
-        size: tuple = None, 
+        folder: os.PathLike,
+        size: tuple = None,
         down_scale_factor: float = None
-    ):
+):
     """
     Resize all images in the input directory to the specified size or keep them at max size.
 
@@ -151,6 +153,8 @@ def rezie_images(
                     # Update max dimensions
                     max_width = max(max_width, width)
                     max_height = max(max_height, height)
+
+    print(f"Max width: {max_width}, max height: {max_height}")
 
     # Step 2: Resize and pad each image
     # Walk through all subdirectories of the root folder
@@ -185,7 +189,8 @@ def rezie_images(
                         padded_img = padded_img.resize(size, Image.LANCZOS)
 
                     if down_scale_factor:
-                        padded_img = padded_img.resize((int(max_width * down_scale_factor), int(max_height * down_scale_factor)), Image.LANCZOS)
+                        padded_img = padded_img.resize(
+                            (int(max_width * down_scale_factor), int(max_height * down_scale_factor)), Image.LANCZOS)
 
                     # Save the image to overwrite the original file
                     padded_img.save(file_path)
@@ -197,12 +202,12 @@ def random_factor(low, high):
 
 def augment_data(
         folder: os.PathLike,
-        total_augmentations: int=20,
-        noise_variability: int=60,
-        max_shearx_factor: int=1,
-        max_sheary_factor: int=0.05,
-        max_augmentations: int=6
-    ):
+        total_augmentations: int = 20,
+        noise_variability: int = 60,
+        max_shearx_factor: int = 1,
+        max_sheary_factor: int = 0.05,
+        max_augmentations: int = 6
+):
     # Define a dictionary that maps operation numbers to functions
     augmentations = {
         0: lambda img: augmentation.noise_image(img, noise_variability),
@@ -287,12 +292,12 @@ def main(args=None):
         args = parser.parse_args()
 
     splits = [
-        'train', 
-        'test', 
+        'train',
+        'test',
     ]
 
     for fold in args.folds:
-        original_data_path = ospj(args.original_data, f'fold_{fold}')   # Path to train and test data
+        original_data_path = ospj(args.original_data, f'fold_{fold}')  # Path to train and test data
         output_data_path = ospj(args.output_dir, f'fold_{fold}_{args.output_name}')  # Path to save the new data
 
         print(f'{original_data_path} -> {output_data_path}')
@@ -305,10 +310,10 @@ def main(args=None):
             splits.append('val')
 
             split_and_move_folder(
-                ospj(output_data_path, 'train'), 
-                ospj(output_data_path, 'val'), 
-                f'Train_Labels_Fold{fold}.txt', 
-                fold, 
+                ospj(output_data_path, 'train'),
+                ospj(output_data_path, 'val'),
+                f'Train_Labels_Fold{fold}.txt',
+                fold,
                 percentage=args.split_ratio
             )
 
@@ -322,7 +327,7 @@ def main(args=None):
         # Augment data
         if args.augmented:
             augment_data(
-                ospj(output_data_path, 'train'), 
+                ospj(output_data_path, 'train'),
                 total_augmentations=args.augmentations_per_image
             )
 
