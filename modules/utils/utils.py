@@ -4,6 +4,7 @@ from typing import Union
 from num2words import num2words
 import numpy as np
 
+
 def split_string_into_chunks(input_string, chunk_size: int):
     """
     Split the input string into chunks of 'chunk_size' characters.
@@ -16,7 +17,7 @@ def split_string_into_chunks(input_string, chunk_size: int):
         list of str: A list containing the split substrings.
     """
     # Use a list comprehension to split the string into chunks of 'chunk_size' characters
-    return [input_string[i:i+chunk_size] for i in range(0, len(input_string), chunk_size)]
+    return [input_string[i:i + chunk_size] for i in range(0, len(input_string), chunk_size)]
 
 
 def gen_phos_label_description(label, name: str = '') -> str:
@@ -86,6 +87,7 @@ def get_phosc_description(word: str) -> str:
 
     return description
 
+
 def get_phosc_number_description(word: str) -> str:
     phos = generate_phos_vector(word)
     phoc = generate_phoc_vector(word)
@@ -95,6 +97,7 @@ def get_phosc_number_description(word: str) -> str:
 
     # flattened_phos = [item for sublist in phos for item in sublist]
     flattened_phos = phos.flatten()
+    print(np.shape(phoc))
     flattened_phoc = phoc.flatten()
 
     phos_str = ' '.join(str(int(x)) for x in flattened_phos)

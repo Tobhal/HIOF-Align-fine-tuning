@@ -16,6 +16,7 @@ from os import PathLike
 from os.path import join as ospj
 
 from typing import List, Tuple
+from dataclasses import dataclass
 
 from timm import create_model
 
@@ -68,7 +69,6 @@ align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
 save_path = ospj('models', 'align-fine-tune', split)
 matrix_save_path = ospj(save_path, 'matrix')
 
-
 # Preprocessing for CLIP
 clip_preprocess = Compose([
     Resize(224, interpolation=Image.BICUBIC),
@@ -78,16 +78,23 @@ clip_preprocess = Compose([
 ])
 
 
+@dataclass
+class Result:
+    model_number: int
+    min_value: float
+    max_value: float
+    average_value: float
 
-def save_matrix(matrix: torch.Tensor, results: tuple, _model_save_path: PathLike, csv_filename="matrix"):
+
+def save_matrix(matrix: torch.Tensor, results: Result, _model_save_path: PathLike, csv_filename="matrix"):
     """
-    Save the given matrix as a CSV file.
+Save the given matrix as a CSV file.
 
-    args:
-        matrix: The matrix to save
-        results (tuple): The results of the evaluation
-        model_save_path (PathLike): The path to save the matrix
-        csv_filename (str): The name of the CSV file to save
+args:
+matrix: The matrix to save
+results (Result): The results of the evaluation
+model_save_path (PathLike): The path to save the matrix
+csv_filename (str): The name of the CSV file to save
     """
     # Extract the directory from the model save path
     directory = os.path.dirname(_model_save_path)
@@ -109,10 +116,10 @@ def save_matrix(matrix: torch.Tensor, results: tuple, _model_save_path: PathLike
 
     # Save the results to a text file
     with open(txt_path, 'w') as f:
-        f.write(f"Model number: {results[0]}\n")
-        f.write(f"Minimum value in matrix: {results[1]}\n")
-        f.write(f"Maximum value in matrix: {results[2]}\n")
-        f.write(f"Mean value in matrix: {results[3]}\n")
+        f.write(f"Model number: {results.model_number}\n")
+        f.write(f"Minimum value in matrix: {results.min_value}\n")
+        f.write(f"Maximum value in matrix: {results.max_value}\n")
+        f.write(f"Mean value in matrix: {results.average_value}\n")
 
     print(f"Matrix saved at: {csv_path}")
 
@@ -167,11 +174,11 @@ class ModelType(Enum):
 
 
 def compute_loss_and_accuracy(
-        images_enc: torch.Tensor, 
-        descriptions_enc: torch.Tensor, 
-        image_names: List[str], 
+        images_enc: torch.Tensor,
+        descriptions_enc: torch.Tensor,
+        image_names: List[str],
         device: str
-    ) -> Tuple[float, float]:
+) -> Tuple[float, float]:
     """
     Compute the loss and accuracy for the given images and descriptions.
 
@@ -199,13 +206,13 @@ def compute_loss_and_accuracy(
 
 
 def clip_process_and_evaluate_batch(
-        image_names: List[str], 
-        descriptions: List[str], 
-        model: nn.Module, 
-        preprocess: nn.Transformer, 
-        loader: ImageLoader, 
+        image_names: List[str],
+        descriptions: List[str],
+        model: nn.Module,
+        preprocess: nn.Transformer,
+        loader: ImageLoader,
         device: str
-    ) -> Tuple[List[float], List[float]]:
+) -> Tuple[List[float], List[float]]:
     """
     Process the images and descriptions in the batch and evaluate the model.
 
@@ -226,26 +233,28 @@ def clip_process_and_evaluate_batch(
     images = torch.cat(images, dim=0)
 
     # Precompute embeddings for all descripdtions in the batch
-    descriptions_enc = torch.stack([clip_text_features_from_description(description, model) for description in descriptions]).squeeze(1)
+    descriptions_enc = torch.stack(
+        [clip_text_features_from_description(description, model) for description in descriptions]).squeeze(1)
 
     # Encode images using the model
     images_enc = model.encode_image(images)
 
     # Calculate cosine similarity between each image and text features in the batch
-    similarity_matrix = torch.nn.functional.cosine_similarity(images_enc.unsqueeze(1), descriptions_enc.unsqueeze(0), dim=2)
-    similarities = similarity_matrix.diag().cpu().tolist() 
+    similarity_matrix = torch.nn.functional.cosine_similarity(images_enc.unsqueeze(1), descriptions_enc.unsqueeze(0),
+                                                              dim=2)
+    similarities = similarity_matrix.diag().cpu().tolist()
 
     return compute_loss_and_accuracy(images_enc, descriptions_enc, image_names, device)
 
 
 def align_process_and_evaluate_batch(
-        image_names: List[str], 
-        descriptions: List[str], 
-        model: nn.Module, 
-        transform: nn.Transformer, 
+        image_names: List[str],
+        descriptions: List[str],
+        model: nn.Module,
+        transform: nn.Transformer,
         loader: ImageLoader,
         device: str
-    ) -> Tuple[List[float], List[float]]:
+) -> Tuple[List[float], List[float]]:
     """
     Process the images and descriptions in the batch and evaluate the model.
 
@@ -283,12 +292,12 @@ def align_process_and_evaluate_batch(
 
 
 def evaluate_model_batch(
-        model: nn.Module, 
-        dataloader: DataLoader, 
+        model: nn.Module,
+        dataloader: DataLoader,
         loader: ImageLoader,
-        device: str, 
+        device: str,
         model_type: ModelType,
-    ) -> Tuple[float, float, List[float]]:
+) -> Tuple[float, float, List[float]]:
     """
     Evaluate the model on the given dataloader and return the average loss and accuracy.
 
@@ -332,12 +341,12 @@ def evaluate_model_batch(
 
 
 def evaluate_text_embedings(
-        model: nn.Module, 
-        dataloader: DataLoader, 
+        model: nn.Module,
+        dataloader: DataLoader,
         loader: ImageLoader,
         # preprocess: nn.Transformer=clip_preprocess, 
         model_type: ModelType = ModelType.CLIP,
-    ) -> torch.Tensor:
+) -> torch.Tensor:
     """
     Evaluate the model on the given dataloader and return the text embeddings for each batch.
 
@@ -383,13 +392,12 @@ def evaluate_text_embedings(
     return batch_features_all
 
 
-def print_results(results):
+def print_results(results: List[Result]):
     for result in results:
-        num, min_value, max_value, average_value = result
-        print(f"Model number {num}:")
-        print(f"Minimum value in matrix: {min_value}")
-        print(f"Maximum value in matrix: {max_value}")
-        print(f"Mean value in matrix: {average_value}")
+        print(f"Model number {result.model_number}:")
+        print(f"Minimum value in matrix: {result.min_value}")
+        print(f"Maximum value in matrix: {result.max_value}")
+        print(f"Mean value in matrix: {result.average_value}")
 
 
 def main(args=None, model=None, index=0) -> Tuple[float, float]:
@@ -424,14 +432,20 @@ def main(args=None, model=None, index=0) -> Tuple[float, float]:
         if args.evaluate == 'model':
             pass
         elif args.evaluate == 'text':
-            batch_features_all = evaluate_text_embedings(align_fine_tuned_model, test_loader, image_loader, ModelType.ALIGN)
+            batch_features_all = evaluate_text_embedings(align_fine_tuned_model, test_loader, image_loader,
+                                                         ModelType.ALIGN)
 
         matrix = calculate_cos_angle_matrix(batch_features_all)
         min_value = torch.min(matrix).item()
         max_value = torch.max(matrix).item()
         average_value = torch.mean(matrix).item()
 
-        res = (num, min_value, max_value, average_value)
+        res = Result(
+            model_number=num,
+            min_value=min_value,
+            max_value=max_value,
+            average_value=average_value
+        )
 
         save_matrix(matrix, res, ospj(model_save_path, num), f'matrix_{num}')
 

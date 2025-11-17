@@ -9,23 +9,25 @@ from argparse import ArgumentParser
 
 from utils.dbe import dbe
 
+
 class EarlyStopping:
     """
     Early stops the training if validation loss doesn't improve after a given patience.
     """
+
     def __init__(
-            self, 
-            save_path: os.PathLike, 
+            self,
+            save_path: os.PathLike,
             loss: float,
-            patience=7, 
-            verbose=True, 
+            patience=7,
+            verbose=True,
             save_every=5,
-            model_arguments: dict = {}, 
-            model_argument_parser: ArgumentParser=None, 
-            save=True, 
+            model_arguments: dict = {},
+            model_argument_parser: ArgumentParser = None,
+            save=True,
             maximize=False,
             validate=False,
-        ):
+    ):
         """
         args:
             save_path (Path): Path to save the model and model arguments.
@@ -60,11 +62,12 @@ class EarlyStopping:
             print(f"Saving model to {self.save_path}")
 
             args_save_path = os.path.join(self.save_path, f'model_args.toml')
-        
+
             # Organize arguments by group
             grouped_args = {}
             for group in model_argument_parser._action_groups:
-                group_dict = {action.dest: getattr(model_arguments, action.dest, None) for action in group._group_actions}
+                group_dict = {action.dest: getattr(model_arguments, action.dest, None) for action in
+                              group._group_actions}
                 if group.title not in ['positional arguments', 'optional arguments']:
                     grouped_args[group.title] = group_dict
 
@@ -82,7 +85,6 @@ class EarlyStopping:
                     metrics_file.write('epoch,train_loss,val_loss\n')
                 else:
                     metrics_file.write('epoch,train_loss\n')
-            
 
     def initialize_save_path(self, base_path: os.PathLike) -> os.PathLike:
         """
@@ -98,7 +100,8 @@ class EarlyStopping:
             os.makedirs(base_path)
             run_number = 1
         else:
-            existing_runs = [int(folder) for folder in os.listdir(base_path) if folder.isdigit() and os.path.isdir(os.path.join(base_path, folder))]
+            existing_runs = [int(folder) for folder in os.listdir(base_path) if
+                             folder.isdigit() and os.path.isdir(os.path.join(base_path, folder))]
             run_number = max(existing_runs) + 1 if existing_runs else 1
 
         run_save_path = os.path.join(base_path, str(run_number))
@@ -140,11 +143,9 @@ class EarlyStopping:
             if self.verbose and self.patience != 0:
                 print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
 
-            """
             if self.counter >= self.patience and self.patience != 0:
                 self.early_stop = True
                 should_stop = True
-            """
 
         # Save latest model as a checkpoint
         self.save_checkpoint(loss, model, 'latest', checkpoint_type='latest')
@@ -167,7 +168,6 @@ class EarlyStopping:
 
         return should_stop
 
-
     def save_checkpoint(self, loss: float, model: nn.Module, name: str, checkpoint_type: str):
         '''
         Saves model and model arguments when validation loss decreases.
@@ -189,13 +189,14 @@ class EarlyStopping:
 
                 loss_diff = abs(loss - self.min_loss)
 
-                print(f'Loss {text}: {self.min_loss:.6f} -> {loss:.6f} | {loss_diff:.6f}. Saving model and arguments ...') 
+                print(
+                    f'Loss {text}: {self.min_loss:.6f} -> {loss:.6f} | {loss_diff:.6f}. Saving model and arguments ...')
             elif checkpoint_type == 'epoch':
                 print(f'Saving model and arguments for epoch {name} ...')
 
         # Save the model
         model_save_path = os.path.join(self.save_path, f'{name}.pt')
         torch.save(model.state_dict(), model_save_path)
-        
+
         if checkpoint_type == 'best':
             self.best_model_path = model_save_path

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torch.backends.cudnn as cudnn
+
 cudnn.benchmark = True
 
 # Python imports
@@ -13,7 +14,7 @@ import os
 from os.path import join as ospj
 import csv
 
-#Local imports
+# Local imports
 from data import dataset_bengali as dset
 from models.common import Evaluator
 from flags import parser, DATA_FOLDER, device
@@ -38,6 +39,7 @@ best_auc = 0
 best_hm = 0
 compose_switch = True
 
+
 def main():
     # Get arguments and start logging
     p = phosc_net_argparse(parser)
@@ -49,7 +51,7 @@ def main():
 
     os.makedirs(logpath, exist_ok=True)
     save_args(args, logpath, args.config)
-    writer = SummaryWriter(log_dir=logpath, flush_secs = 30)
+    writer = SummaryWriter(log_dir=logpath, flush_secs=30)
 
     # Define phosc model
     phosc_model = create_model(
@@ -85,7 +87,7 @@ def main():
         model=args.image_extractor,
         num_negs=args.num_negs,
         pair_dropout=args.pair_dropout,
-        update_features = args.update_features,
+        update_features=args.update_features,
         train_only=args.train_only,
         open_world=args.open_world,
         augmented=args.augmented,
@@ -101,12 +103,12 @@ def main():
     )
 
     test_set = dset.CompositionDataset(
-        root=os.path.join(DATA_FOLDER,args.data_dir),
+        root=os.path.join(DATA_FOLDER, args.data_dir),
         phase='test',
         split=args.splitname,
-        model =args.image_extractor,
+        model=args.image_extractor,
         subset=args.subset,
-        update_features = args.update_features,
+        update_features=args.update_features,
         open_world=args.open_world,
         augmented=args.augmented,
         phosc_model=phosc_model,
@@ -232,20 +234,20 @@ def main():
         model.load_state_dict(checkpoint['net'])
         start_epoch = checkpoint['epoch']
         print('Loaded model from ', args.load)
-    
+
     for epoch in tqdm(range(start_epoch, args.max_epochs + 1), desc='Current epoch'):
         train(epoch, image_extractor, model, train_loader, optimizer, writer)
         # train(epoch, image_extractor, model, train_loader, optimizer, writer)
 
         if model.is_open and args.model == 'compcos' and ((epoch + 1) % args.update_feasibility_every) == 0:
             print('Updating feasibility scores')
-            model.update_feasibility(epoch+1.)
+            model.update_feasibility(epoch + 1.)
 
         if epoch % args.eval_val_every == 0:
-            with torch.no_grad(): # todo: might not be needed
+            with torch.no_grad():  # todo: might not be needed
                 test(epoch, image_extractor, model, test_loader, evaluator_val, writer, args, logpath)
                 # test(epoch, image_extractor, model, test_loader, evaluator_val, writer, args, logpath)
-                
+
     print('Best AUC achieved is ', best_auc)
     print('Best HM achieved is ', best_hm)
 
@@ -257,10 +259,10 @@ def train_normal(epoch, image_extractor, model, train_loader, optimizer, writer)
     if image_extractor:
         image_extractor.train()
 
-    model.train() # Let's switch to training
+    model.train()  # Let's switch to training
 
-    train_loss = 0.0 
-    for idx, data in tqdm(enumerate(train_loader), total=len(train_loader), desc = 'Training'):
+    train_loss = 0.0
+    for idx, data in tqdm(enumerate(train_loader), total=len(train_loader), desc='Training'):
         data = [d.to(device) for d in data]
 
         if image_extractor:
@@ -271,10 +273,10 @@ def train_normal(epoch, image_extractor, model, train_loader, optimizer, writer)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    
+
         train_loss += loss.item()
 
-    train_loss = train_loss/len(train_loader)
+    train_loss = train_loss / len(train_loader)
 
     writer.add_scalar('Loss/train_total', train_loss, epoch)
     print('Epoch: {}| Loss: {}'.format(epoch, round(train_loss, 2)))
@@ -295,7 +297,7 @@ def test(epoch, image_extractor, model, test_loader, evaluator, writer, args, lo
 
         if image_extractor:
             state['image_extractor'] = image_extractor.state_dict()
-        
+
         torch.save(state, os.path.join(logpath, 'ckpt_{}.t7'.format(filename)))
 
     if image_extractor:
@@ -323,7 +325,8 @@ def test(epoch, image_extractor, model, test_loader, evaluator, writer, args, lo
     if args.cpu_eval:
         all_attr_gt, all_obj_gt, all_pair_gt = torch.cat(all_attr_gt), torch.cat(all_obj_gt), torch.cat(all_pair_gt)
     else:
-        all_attr_gt, all_obj_gt, all_pair_gt = torch.cat(all_attr_gt).to('cpu'), torch.cat(all_obj_gt).to('cpu'), torch.cat(all_pair_gt).to('cpu')
+        all_attr_gt, all_obj_gt, all_pair_gt = torch.cat(all_attr_gt).to('cpu'), torch.cat(all_obj_gt).to(
+            'cpu'), torch.cat(all_pair_gt).to('cpu')
 
     all_pred_dict = {}
     # Gather values as dict of (attr, obj) as key and list of predictions as values

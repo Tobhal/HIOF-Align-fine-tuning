@@ -29,18 +29,52 @@ def compute_triplet_margin_loss(logits_per_image: Tensor, class_labels: Tensor, 
         else:
             positive_scores.append(torch.tensor(0.0, device=logits_per_image.device))
 
-    positive_pairs = torch.stack(positive_scores) if positive_scores else torch.tensor([0.0], device=logits_per_image.device)
+    positive_pairs = torch.stack(positive_scores) if positive_scores else torch.tensor([0.0],
+                                                                                       device=logits_per_image.device)
 
     # Negative pairs
     negative_mask = ~same_class_mask
 
     negative_mask = negative_mask.to(logits_per_image.device)
 
-    max_negative_logits = torch.where(negative_mask, logits_per_image, torch.tensor(float('-inf')).to(logits_per_image.device))
+    max_negative_logits = torch.where(negative_mask, logits_per_image,
+                                      torch.tensor(float('-inf')).to(logits_per_image.device))
     negative_pairs = max_negative_logits.max(dim=1)[0]
 
     # Compute loss
     loss = F.relu((positive_pairs - negative_pairs) + margin).mean()
+    return loss
+
+
+def triplet_margin_from_similarity(S: torch.Tensor, labels: torch.Tensor, margin: float = 0.2) -> torch.Tensor:
+    """
+S: (B, B) pairwise similarities (higher = more similar)
+labels: (B,) class labels
+    """
+    B = S.size(0)
+    device = S.device
+
+    same = labels.unsqueeze(0).eq(labels.unsqueeze(1))  # (B,B)
+    eye = torch.eye(B, dtype=torch.bool, device=device)
+
+    pos_mask = same & ~eye  # exclude self
+    neg_mask = ~same
+
+    # hardest positive: MIN similarity among positives
+    pos_sim = torch.where(pos_mask, S, torch.full_like(S, float('inf')))
+    hardest_pos = pos_sim.min(dim=1).values  # (B,)
+
+    # hardest negative: MAX similarity among negatives
+    neg_sim = torch.where(neg_mask, S, torch.full_like(S, float('-inf')))
+    hardest_neg = neg_sim.max(dim=1).values  # (B,)
+
+    # keep anchors that actually have at least 1 pos and 1 neg
+    valid = torch.isfinite(hardest_pos) & torch.isfinite(hardest_neg)
+    if not valid.any():
+        return torch.tensor(0.0, device=device)
+
+    # similarity-based triplet: max(0, margin + s_neg - s_pos)
+    loss = F.relu(margin + hardest_neg[valid] - hardest_pos[valid]).mean()
     return loss
 
 
@@ -58,14 +92,14 @@ def compute_contrastive_loss(logits_per_image: Tensor, class_labels: Tensor, mar
         A scalar tensor representing the mean contrastive loss.
     """
     same_class_mask = class_labels.unsqueeze(1) == class_labels.unsqueeze(0)
-    
+
     class_labels = class_labels.to(logits_per_image.device)
     same_class_mask = same_class_mask.to(logits_per_image.device)
 
     # Positive scores
     positive_scores = logits_per_image.masked_select(same_class_mask.fill_diagonal_(False))
     negative_scores = logits_per_image.masked_select(~same_class_mask)
-    
+
     # Check if there are positive or negative scores and compute losses accordingly
     if positive_scores.numel() == 0:
         positive_loss = torch.tensor(0.0, device=logits_per_image.device, dtype=logits_per_image.dtype)

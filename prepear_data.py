@@ -196,6 +196,44 @@ def rezie_images(
                     padded_img.save(file_path)
 
 
+def rezie_images_new(  # keep name to avoid touching callers
+                 folder: os.PathLike,
+                 size: tuple = (224, 224),      # final (W,H) for CLIP/ALIGN
+                 down_scale_factor: float = None,
+                 background_color: tuple = (255, 255, 255)
+                 ):
+    """
+Square-pad every image on a white canvas, then resize to `size`.
+Note: model-specific normalization happens at training time via processors.
+    """
+    target_w, target_h = size if size is not None else (224, 224)
+
+    for dirpath, _, filenames in tqdm(os.walk(folder), desc='Square-padding & resizing'):
+        for filename in filenames:
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                continue
+            file_path = ospj(dirpath, filename)
+            with Image.open(file_path) as img:
+                # ensure RGB + deterministic downscale
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                w, h = img.size
+                side = max(w, h)
+
+                # center-pad to square (white)
+                canvas = Image.new('RGB', (side, side), background_color)
+                canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+
+                # optional legacy downscale step (kept for compatibility)
+                if down_scale_factor:
+                    new_side = max(1, int(side * float(down_scale_factor)))
+                    canvas = canvas.resize((new_side, new_side), Image.LANCZOS)
+
+                # final resize to model-native input
+                canvas = canvas.resize((target_w, target_h), Image.LANCZOS)
+                canvas.save(file_path, quality=95)
+
+
 def random_factor(low, high):
     return np.random.uniform(low, high)
 
@@ -322,7 +360,8 @@ def main(args=None):
             gen_data_csv(ospj(output_data_path, split), fold)
 
         # Rezie images
-        rezie_images(ospj(output_data_path), down_scale_factor=args.down_scale_factor)
+        # rezie_images(ospj(output_data_path), down_scale_factor=args.down_scale_factor)
+        rezie_images_new(ospj(output_data_path), size=(args.target_res, args.target_res), down_scale_factor=None)
 
         # Augment data
         if args.augmented:

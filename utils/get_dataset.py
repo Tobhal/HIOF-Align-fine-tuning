@@ -6,7 +6,9 @@ from modules.utils import set_phos_version, set_phoc_version
 from timm import create_model
 
 
-def get_training_loader(args, phosc_net_model=None) -> DataLoader:
+def get_training_loader(args, phosc_net_model=None, collate_fn=None) -> DataLoader:
+    print(DATA_FOLDER, args.data_dir)
+
     # Get dataset
     train_set = dset.CompositionDataset(
         root=ospj(DATA_FOLDER, args.data_dir),
@@ -15,13 +17,13 @@ def get_training_loader(args, phosc_net_model=None) -> DataLoader:
         model=args.image_extractor,
         num_negs=args.num_negs,
         pair_dropout=args.pair_dropout,
-        update_features = args.update_features,
+        update_features=args.update_features,
         train_only=args.train_only,
         open_world=args.open_world,
         add_original_data=True,
         augmented=args.augmented,
         phosc_model=phosc_net_model,
-        print_info=args.print_info
+        print_info=args.print_info,
     )
 
     train_loader = DataLoader(
@@ -29,7 +31,8 @@ def get_training_loader(args, phosc_net_model=None) -> DataLoader:
         batch_size=args.batch_size,
         shuffle=args.shuffled,
         num_workers=args.workers,
-        drop_last=True
+        drop_last=True,
+        collate_fn=collate_fn
     )
 
     return train_loader, train_set
@@ -38,13 +41,13 @@ def get_training_loader(args, phosc_net_model=None) -> DataLoader:
 def get_validation_loader(args, phosc_net_model=None) -> DataLoader:
     # Get dataset
     val_set = dset.CompositionDataset(
-        root=ospj(DATA_FOLDER,args.data_dir),
+        root=ospj(DATA_FOLDER, args.data_dir),
         phase='val',
         split=args.split_name,
         model=args.image_extractor,
         num_negs=args.num_negs,
         pair_dropout=args.pair_dropout,
-        update_features = args.update_features,
+        update_features=args.update_features,
         train_only=args.train_only,
         open_world=args.open_world,
         add_original_data=True,
@@ -67,12 +70,12 @@ def get_validation_loader(args, phosc_net_model=None) -> DataLoader:
 def get_test_loader(args, phosc_net_model=None) -> DataLoader:
     # Get dataset
     test_set = dset.CompositionDataset(
-        root=ospj(DATA_FOLDER,args.data_dir),
+        root=ospj(DATA_FOLDER, args.data_dir),
         phase=args.test_set,
         split=args.split_name,
-        model =args.image_extractor,
+        model=args.image_extractor,
         subset=args.subset,
-        update_features = args.update_features,
+        update_features=args.update_features,
         open_world=args.open_world,
         add_original_data=True,
         augmented=False,
