@@ -15,7 +15,7 @@ def aling_fine_tune_argparse(parser: argparse.ArgumentParser) -> argparse.Argume
     align_fine_tune_parser.add_argument('--accumulation_steps', type=int, default=4,
                                         help='number of steps to accumulate gradients')
 
-    align_fine_tune_parser.add_argument('--description', choices=['word', 'description', 'phosc_number'],
+    align_fine_tune_parser.add_argument('--description', choices=['word', 'description', 'phosc_number', 'description_long'],
                                         default='word', help='description to use for align fine-tuning')
     align_fine_tune_parser.add_argument("--mse_weight", type=float, default=0.1)
     align_fine_tune_parser.add_argument("--head_hidden_dim", type=int, default=1024)

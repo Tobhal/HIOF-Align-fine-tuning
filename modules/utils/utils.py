@@ -50,7 +50,7 @@ def gen_phos_label_description(label, name: str = '') -> str:
                 shape_description += f'shape {num2words(idx + 1)} is present {num2words(int(shape))} times'
 
                 if idx == len(phos[0]) - 1:
-                    shape_description += '.\n'
+                    shape_description += '. '
                 else:
                     shape_description += ', '
 
@@ -81,7 +81,7 @@ def get_phosc_description(word: str) -> str:
 
     description = ''
 
-    # description += gen_phos_label_description(phos)
+    description += gen_phos_label_description(phos)
     # description += '\n'
     description += gen_phoc_label_description(word)
 
@@ -90,19 +90,16 @@ def get_phosc_description(word: str) -> str:
 
 def get_phosc_number_description(word: str) -> str:
     phos = generate_phos_vector(word)
-    phoc = generate_phoc_vector(word)
+    phoc = generate_phoc_vector(word, level=1)
 
     phos = np.array(phos)
     phoc = [np.concatenate(sublist) for sublist in phoc]
 
     # flattened_phos = [item for sublist in phos for item in sublist]
     flattened_phos = phos.flatten()
-    print(np.shape(phoc))
-    flattened_phoc = phoc.flatten()
+    flattened_phoc = np.concatenate(phoc)
 
     phos_str = ' '.join(str(int(x)) for x in flattened_phos)
     phoc_str = ' '.join(str(x) for x in flattened_phoc)
 
-    dbe(phos_str, phoc_str)
-
-    return ''
+    return f'Shape indecies: {phos_str}\nCharacter indecies: {phoc_str}'

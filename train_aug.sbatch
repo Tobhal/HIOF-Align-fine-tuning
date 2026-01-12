@@ -17,4 +17,23 @@
 # Commands to run your GPU job
 # python align_fine_tuning.py --batch_size 32 --accumulation_steps 4 --augmented --epochs 500 --lr 0.0001 --maximize --stop_patience 50 --save --save_every 10 --verbose --loss_func contrastive --split_name fold_3_aug_square --validate --ignore_checkpoint --description description --slurm_job_id $SLURM_JOB_ID --slurm_job_desc "d phosc"
 
-python align_fine_tuning.py --batch_size 32 --accumulation_steps 4 --augmented --epochs 500 --lr 0.000001 --maximize --stop_patience 50 --save --save_every 10 --verbose --loss_func contrastive --split_name fold_3_aug_square --validate --ignore_checkpoint --description description --slurm_job_id $SLURM_JOB_ID --slurm_job_desc "d phosc" --descriptio "phosc_number"
+srun python align_fine_tuning.py \
+--batch_size 32 \
+--accumulation_steps 8 \
+--augmented \
+--epochs 500 \
+--lr 1e-10 \
+--maximize \
+--stop_patience 50 \
+--save \
+--save_every 10 \
+--verbose \
+--loss_func contrastive \
+--split_name fold_3_aug_square \
+--validate \
+--ignore_checkpoint \
+--slurm_job_id $SLURM_JOB_ID \
+--slurm_job_desc "d phosc" \
+--description "description_long" \
+--lr_scheduler "cosine" \
+--lr_exploration_factor 1.5

@@ -361,6 +361,8 @@ def train_epoch(
             descriptions = [get_phosc_description(w) for w in words]
         elif description == 'phosc_number':
             descriptions = [get_phosc_number_description(w) for w in words]
+        elif description == 'description_long':
+            descriptions = [get_phosc_description(w) for w in words]
         else:
             raise ValueError('Invalid description')
 
@@ -452,6 +454,8 @@ def validate_epoch(
                 descriptions = [get_phosc_description(w) for w in words]
             elif description == 'phosc_number':  # <-- add parity with train
                 descriptions = [get_phosc_number_description(w) for w in words]
+            elif description == 'description_long':
+                descriptions = [get_phosc_description(w) for w in words]
             else:
                 raise ValueError('Invalid description')
 

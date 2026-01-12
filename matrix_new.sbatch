@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name prep_data         # Job name
+#SBATCH --job-name matrix_plot         # Job name
 #SBATCH --output logs/matrix_new/matrix_new_%j.log    # Standard output and error log
 #SBATCH --partition normal          # Partition (queue) to submit to
 #SBATCH --ntasks=1                   # Number of tasks (processes) to launch
@@ -12,4 +12,4 @@
 # module load python3
 
 # Execute the script
-python matrix_new.py --split_name fold_3_aug_square --nums 5 6 7 --heatmap
+python matrix_new.py --split_name fold_3_aug_square --nums 23 24 --heatmap
