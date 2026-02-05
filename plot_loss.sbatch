@@ -7,4 +7,9 @@
 #SBATCH --mem=4G                        # Memory (default units are megabytes)
 #SBATCH --time=1:00:00                 # Time limit hrs:min:sec
 
-python plot_loss.py --nums 20 21 22 --save_plot --split_name fold_3_aug_square
+python plot_loss.py \
+  --nums 5 6 7 \
+  --save_plot \
+  --split_name fold_3_aug_square \
+  --save_name "clip-fine-tune"
+  #--save_name "align-fine-tune"

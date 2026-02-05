@@ -35,8 +35,18 @@ from modules.utils import set_phos_version, set_phoc_version, gen_shape_descript
 # from train_clip.utils.clip_utils import gen_word_objs_embpeddings
 from utils.dbe import dbe
 from utils.early_stopping import EarlyStopping
-from parser import phosc_net_argparse, dataset_argparse, early_stopper_argparse, aling_fine_tune_argparse, \
-    optimizer_argparse, lr_scheduler_argparse, checkpoint_argparse, slurm_argparse
+from parser import (
+    phosc_net_argparse,
+    dataset_argparse,
+    early_stopper_argparse,
+    aling_fine_tune_argparse,
+    optimizer_argparse,
+    lr_scheduler_argparse,
+    checkpoint_argparse,
+    slurm_argparse,
+    training_common_argparse,
+    loss_func_argparse
+)
 from utils.utils import load_args
 from utils.get_dataset import get_training_loader, get_validation_loader, get_test_loader, get_phoscnet
 from utils.loss_functions import compute_triplet_margin_loss, compute_contrastive_loss, simple_loss, \
@@ -504,6 +514,8 @@ def main(_args=None):
     parser = lr_scheduler_argparse(parser)
     parser = checkpoint_argparse(parser)
     parser = slurm_argparse(parser)
+    parser = training_common_argparse(parser)
+    parser = loss_func_argparse(parser)
 
     # Parse arguments
     if _args is None:

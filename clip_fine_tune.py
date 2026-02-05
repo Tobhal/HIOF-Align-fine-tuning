@@ -1,15 +1,19 @@
-# Standard library imports, sorted alphabetically
+# Standard library imports
 import argparse
+import contextlib
 import logging
 import math
 import os
+import random
+import sys
 from enum import Enum
 from os.path import join as ospj
-from typing import Any, List, Tuple
+from typing import Any, Callable, List, Tuple
 
-# Third-party imports, sorted alphabetically
+# Third-party imports
 import clip
 import numpy as np
+import pynvml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,15 +22,27 @@ import torch.optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import _LRScheduler
+from torch.nn import Module
 
-# Application-specific imports, sorted alphabetically
+# Application-specific imports
 from data.dataset_bengali import ImageLoader
+from data import dataset_bengali as dset
 from flags import DATA_FOLDER, device
+from modules import models, residualmodels
+from modules.utils.utils import get_phosc_description, get_phosc_number_description
 from parser import (
     clip_fine_tune_argparse,
     dataset_argparse,
     early_stopper_argparse,
     phosc_net_argparse,
+    optimizer_argparse,
+    lr_scheduler_argparse,
+    checkpoint_argparse,
+    slurm_argparse,
+    loss_func_argparse,
+    training_common_argparse
 )
 from train_clip.models.model import CLIP
 from train_clip.utils.clip_utils import gen_word_objs_embeddings
@@ -35,34 +51,72 @@ from utils.get_dataset import (
     get_phoscnet,
     get_training_loader,
     get_validation_loader,
+    get_test_loader,
 )
 from utils.dbe import dbe
+from utils.loss_functions import (
+    compute_triplet_margin_loss,
+    compute_contrastive_loss,
+    simple_loss,
+    triplet_margin_from_similarity,
+)
+from utils.lamb_optimizer import Lamb
+from utils.lr_schedulers.exploration import ExplorationOptimizationScheduler
+from utils.checkpoint import save_checkpoint, load_checkpoint
+from utils.utils import load_args
+
+pynvml.nvmlInit()
+
+
+def create_file_with_job_id(save_path: os.PathLike, job_id: int, job_description: str):
+    with open(ospj(save_path, f'slurm_{job_id}.txt'), 'w') as file:
+        file.write(job_description)
+
+
+def get_gpu_memory_usage():
+    """Get current and peak (max) memory usage of the GPU in gigabytes, including total system GPU memory usage."""
+    device_id = 0  # Assuming we're querying the first GPU
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    allocated_memory = torch.cuda.memory_allocated(device_id)  # current memory allocated by PyTorch
+    peak_memory = torch.cuda.max_memory_allocated(device_id)  # peak memory allocated by PyTorch
+    total_memory = torch.cuda.get_device_properties(device_id).total_memory  # total memory of GPU
+
+    # System-wide GPU memory usage
+    system_allocated_memory = info.used  # total memory used by all processes
+
+    # Convert bytes to gigabytes
+    allocated_memory_gb = allocated_memory / (1024 ** 3)
+    peak_memory_gb = peak_memory / (1024 ** 3)
+    total_memory_gb = total_memory / (1024 ** 3)
+    system_allocated_memory_gb = system_allocated_memory / (1024 ** 3)
+
+    return {
+        'Allocated Memory (GB)': allocated_memory_gb,
+        'Peak Memory (GB)': peak_memory_gb,
+        'Total Memory (GB)': total_memory_gb,
+        'System Allocated Memory (GB)': system_allocated_memory_gb
+    }
 
 
 def setup_logging(log_file_path: os.PathLike):
     """
     Setup logging for the training process.
-    
+
     args:
         log_file_path (os.PathLike): Log file path.
     """
-    logging.basicConfig(filename=log_file_path, level=logging.INFO, 
-                        format='%(asctime)s - %(levelname)s - %(message)s', 
+    logging.basicConfig(filename=log_file_path, level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
-    
+
     logging.info("Initialized logging")
 
 
 # Function to check if the model save path's directory exists
-def verify_model_save_path(path: os.PathLike):
-    """
-    Verify if the model save path exists, if not, create it.
-
-    args:
-        path (os.PathLike): Model save path.
-    """
+def verify_model_save_path(path):
     directory = os.path.dirname(path)
-
     if not os.path.exists(directory):
         print(f"Model save directory does not exist, creating: {directory}")
         os.makedirs(directory)
@@ -221,65 +275,107 @@ def calc_loss(
 
 
 def create_learning_rate_fn(
-    optimizer: torch.optim.Optimizer,
-    train_ds_size: int,
-    train_batch_size: int,
-    num_train_epochs: int,
-    num_warmup_steps: int,
-    learning_rate: float,
-    linear=False
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """
-    Returns a PyTorch learning rate scheduler.
-
-    args:
-        optimizer (torch.optim.Optimizer): Optimizer.
-        train_ds_size (int): Training dataset size.
-        train_batch_size (int): Batch size.
-        num_train_epochs (int): Number of training epochs.
-        num_warmup_steps (int): Number of warmup steps.
-        learning_rate (float): Learning rate.
-        linear (bool): If True, use linear learning rate decay.
-
-    returns:
-        lr_scheduler (torch.optim.lr_scheduler.LambdaLR): Learning rate scheduler.
-    """
-    # Calculate the number of steps per epoch
+        optimizer: Optimizer,
+        train_ds_size: int,
+        train_batch_size: int,
+        num_train_epochs: int,
+        num_warmup_steps: int,
+        learning_rate: float,
+        linear=False
+):
+    """Returns a PyTorch learning rate scheduler."""
     steps_per_epoch = train_ds_size // train_batch_size
     num_train_steps = steps_per_epoch * num_train_epochs
 
-    # Learning rate function
-    def lr_lambda(current_step: int) -> float:
-        """
-        Learning rate function.
-
-        args:
-            current_step (int): Current step.
-
-        returns:
-            lr (float): Learning rate.
-        """
-        # Warmup
+    def lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            # Calculate the learning rate
             return float(current_step) / float(max(1, num_warmup_steps))
-        
-        # Linear decay
         if linear:
-            # Calculate the learning rate
             return max(
                 0.0, float(num_train_steps - current_step) / float(max(1, num_train_steps - num_warmup_steps))
             )
-        else:
-            # Cosine decay
+        else:  # Cosine decay
             return 0.5 * (1 + np.cos(np.pi * (current_step - num_warmup_steps) / (num_train_steps - num_warmup_steps)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def create_cosine_annealing_lr_scheduler(
+        optimizer: Optimizer,
+        T_0,
+        T_mult=1,
+        eta_min=0,
+        last_epoch=-1
+):
+    """Returns a PyTorch Cosine Annealing scheduler with Warm Restarts."""
+    return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, last_epoch=last_epoch
+    )
+
+
+def make_accum_scheduler(optimizer, len_train_loader, accumulation_steps, num_epochs,
+                         warmup_steps=0, linear=False):
+    """LambdaLR that expects one .step() per *optimizer step* (i.e., per accumulation boundary)."""
+    steps_per_epoch = math.ceil(len_train_loader / accumulation_steps)
+    num_train_steps = steps_per_epoch * num_epochs
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        if linear:
+            return max(0.0, float(num_train_steps - current_step) /
+                       float(max(1, num_train_steps - warmup_steps)))
+        # cosine
+        progress = (current_step - warmup_steps) / float(max(1, num_train_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def preprocess_clip_batch(clip_preprocess, images, texts):
+    """
+    Preprocess images for CLIP model.
+
+    args:
+        clip_preprocess: CLIP preprocessing transform
+        images: List of PIL images
+        texts: List of text strings (not used for CLIP, handled separately)
+
+    returns:
+        Preprocessed images tensor
+    """
+    # CLIP expects preprocessed images as tensors
+    processed_images = torch.stack([clip_preprocess(img) for img in images])
+    return processed_images
+
+
+def supcon_infonce_from_logits(logits_per_image, logits_per_text, labels, symmetric=True):
+    """
+    labels: LongTensor [B] with class/word ids. Supports multiple positives per class.
+    """
+
+    def _supcon(logits, labels):
+        B = logits.size(0)
+        device = logits.device
+        # mask of positives (exclude self on diagonal)
+        pos = labels.unsqueeze(0).eq(labels.unsqueeze(1))  # [B,B] bool
+        pos.fill_diagonal_(False)
+        # log-softmax over rows
+        log_prob = logits.log_softmax(dim=1)  # [B,B]
+        # average log-prob over all positives per row (avoid div by 0)
+        pos_counts = pos.sum(dim=1).clamp_min(1)
+        loss = -(log_prob * pos).sum(dim=1) / pos_counts
+        return loss.mean()
+
+    # Temperature is already baked into CLIP's logits
+    loss_i = _supcon(logits_per_image, labels)
+    loss_t = _supcon(logits_per_text, labels) if symmetric else 0.0
+    return 0.5 * (loss_i + loss_t) if symmetric else loss_i
+
+
 def adaptive_grad_clip(
-        parameters: List[Any], 
-        clip_factor: float, 
+        parameters: List[Any],
+        clip_factor: float,
         eps: float = 1e-3
     ):
     """
@@ -293,364 +389,390 @@ def adaptive_grad_clip(
     for p in parameters:
 
         if p.grad is not None:
-            
+
             # Compute the gradient norm
             grad_norm = p.grad.norm()
             max_norm = clip_factor / (eps + grad_norm)
             p.grad.data.clamp_(-max_norm, max_norm)
 
 
-def train_step_batch(
-        images: List[Image.Image], 
-        text_feat: torch.Tensor, 
-        class_labels: torch.Tensor,  # Add this to pass class labels
-        batch_size: int, 
-        clip_model: CLIP, 
-        optimizer=None, 
-        lr_scheduler=None,
-        margin: float = 1.0
-    ) -> float:
-    """
-    Train the model for one batch.
+def train_epoch(
+        epoch: int,
+        train_loader: DataLoader,
+        model: Module,
+        clip_preprocess,
+        image_loader: ImageLoader,
+        loss_func: str,
+        optimizer: Optimizer,
+        save_path: str,
+        lr_scheduler: _LRScheduler = None,
+        margin=1.0,
+        accumulation_steps=4,
+        description='word'
+):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
 
-    args:
-        images (List[Image.Image]): List of images.
-        text_feat (torch.Tensor): Text features.
-        class_labels (torch.Tensor): Class labels.
-        batch_size (int): Batch size.
-        clip_model (nn.Module): CLIP model.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        lr_scheduler (torch.optim.lr_scheduler): Learning rate scheduler.
-        margin (float): The margin for the triplet loss.
+    total_batches = len(train_loader)
+    micro_loss_accum = 0.0
+    running_loss = 0.0
+    num_steps = 0
 
-    returns:
-        loss (float): Training loss.
-    """
-    # Transform setup
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-    ])
-
-    # Process images
-    images = torch.stack([transform(img) for img in images])
-
-    # Split images into batches
-    image_emb = torch.chunk(images, math.ceil(len(images) / batch_size))
-
-    # Normalize image embeddings after encoding
-    ims = [F.normalize(clip_model.encode_image(batch), dim=1) for batch in image_emb]
-    ims = torch.cat(ims)
-
-    # Normalize text features after averaging across the token dimension
-    txt = F.normalize(text_feat, dim=1)
-    txt = txt.squeeze(1)
-
-    # Compute similarity scores between images and texts
-    image_logits = ims @ txt.t() * clip_model.logit_scale.exp()
-
-    # Mask for identifying pairs of the same class
-    same_class_mask = class_labels.unsqueeze(1) == class_labels.unsqueeze(0)
-
-    # Positive pairs: Maximize similarity for pairs of the same class
-    positive_scores = []
-    for i in range(class_labels.size(0)):
-        # Mask to select same-class items, excluding self-comparison
-        mask = (class_labels == class_labels[i]) & (torch.arange(class_labels.size(0)) != i)
-        if mask.any():
-            positive_scores.append(image_logits[i][mask].max())
-        else:
-            # Handle the case where there are no other same-class items
-            positive_scores.append(torch.tensor(0.0, device=image_logits.device))
-
-    if positive_scores:
-        positive_pairs = torch.stack(positive_scores)
-    else:
-        # Fallback or alternative handling if no positive pairs are found
-        positive_pairs = torch.tensor([0.0], device=image_logits.device)
-
-    # Negative pairs: For each anchor, take the closest negative that's not of the same class
-    negative_mask = ~same_class_mask
-    max_negative_logits = torch.where(negative_mask, image_logits, torch.tensor(float('-inf')).to(image_logits.device))
-    negative_pairs = max_negative_logits.max(dim=1)[0]
-
-    # Compute triplet loss
-    total_loss = F.relu(positive_pairs - negative_pairs + margin).mean()
-
-    optimizer.zero_grad()
-    total_loss.backward()
-
-    if optimizer:
-        optimizer.step()
-
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-
-    # Clamp the logit scale
-    clip_model.logit_scale.data = clip_model.logit_scale.data.clamp(-np.log(100), np.log(100))
-    
-    return total_loss.item()
-
-
-def train_one_epoch(
-        epoch: int, 
-        train_loader: DataLoader, 
-        clip_model: CLIP, 
-        image_loader: ImageLoader, 
-        batch_size: int,
-        optimizer=None, 
-        lr_scheduler=None,
-        margin: float = 1.0
-    ) -> float:
-    """
-    Train the model for one epoch.
-
-    args:
-        epoch (int): Current epoch number.
-        train_loader (DataLoader): Training DataLoader.
-        clip_model (nn.Module): CLIP model.
-        image_loader (ImageLoader): Image loader.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        lr_scheduler (torch.optim.lr_scheduler): Learning rate scheduler.
-
-    returns:
-        loss (float): Training loss.
-    """
-    clip_model.train()
-    running_loss = 0
-
-    train_bar = tqdm(train_loader, desc=f'Fine-tuning epoch {epoch + 1}', position=1, leave=True)
-    for batch in train_bar:
-        optimizer.zero_grad()
-
+    for i, batch in enumerate(train_loader):
         *_, image_names, _, words = batch
+        images = [image_loader(img_name) for img_name in image_names]
 
-        images = [image_loader(image) for image in tqdm(image_names, position=2, desc='Processing Images', leave=False)]
+        if description == 'word':
+            descriptions = words
+        elif description == 'description':
+            descriptions = [get_phosc_description(w) for w in words]
+        elif description == 'phosc_number':
+            descriptions = [get_phosc_number_description(w) for w in words]
+        elif description == 'description_long':
+            descriptions = [get_phosc_description(w) for w in words]
+        else:
+            raise ValueError('Invalid description')
 
-        emb_descriptions = [gen_word_objs_embeddings(description, clip_model) for description in tqdm(words, position=2, desc='Generating Embeddings', leave=False)]
-        emb_descriptions = torch.stack(emb_descriptions)
+        # one-off example file
+        example_path = ospj(save_path, 'description_example.txt')
+        if not os.path.exists(example_path):
+            with open(example_path, 'w') as f:
+                f.write(f'{words[0]}\n{descriptions[0]}')
 
-        unique_classes = set(words)  # Find the unique classes
-        class_to_index = {cls: idx for idx, cls in enumerate(unique_classes)}  # Create a mapping
+        uniq = sorted(set(words))
+        w2i = {w: idx for idx, w in enumerate(uniq)}
+        class_labels = torch.tensor([w2i[w] for w in words], device=device, dtype=torch.long)
 
-        class_indices = [class_to_index[cls] for cls in words]
-        class_labels_tensor = torch.tensor(class_indices)
+        # Preprocess images for CLIP
+        processed_images = preprocess_clip_batch(clip_preprocess, images, descriptions).to(device)
 
-        temp_loss = train_step_batch(images, emb_descriptions, class_labels_tensor, batch_size, clip_model, optimizer, lr_scheduler, margin)
+        # Encode images
+        image_features = model.encode_image(processed_images)
+        image_features = F.normalize(image_features, dim=1)
 
-        running_loss += temp_loss
+        # Encode text
+        text_features = torch.stack([gen_word_objs_embeddings(desc, model) for desc in descriptions])
+        text_features = F.normalize(text_features.squeeze(1), dim=1)
 
-    loss = running_loss / len(train_loader)
+        # Compute similarity logits
+        logits_per_image = image_features @ text_features.t() * model.logit_scale.exp()
+        logits_per_text = logits_per_image.t()
 
-    if optimizer:
-        optimizer.step()
+        if loss_func == 'triplet':
+            loss = triplet_margin_from_similarity(logits_per_image, class_labels, margin)
+        elif loss_func == 'contrastive':
+            loss = compute_contrastive_loss(logits_per_image, class_labels, margin)
+        elif loss_func == 'simple':
+            loss = simple_loss(logits_per_image)
+        elif loss_func == 'supcon':
+            loss = supcon_infonce_from_logits(logits_per_image, logits_per_text,
+                                              class_labels, symmetric=True)
+        else:
+            raise ValueError('Invalid loss function')
 
-    if lr_scheduler:
-        lr_scheduler.step()
+        # accumulate micro-batch losses for accurate logging
+        micro_loss_accum += float(loss.item())
 
-    return loss
+        (loss / accumulation_steps).backward()
+
+        boundary = ((i + 1) % accumulation_steps == 0) or ((i + 1) == total_batches)
+        if boundary:
+            optimizer.step()
+
+            if hasattr(model, "logit_scale") and isinstance(model.logit_scale, torch.nn.Parameter):
+                with torch.no_grad():
+                    model.logit_scale.clamp_(0, math.log(100.0))
+
+            optimizer.zero_grad(set_to_none=True)
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
+            running_loss += micro_loss_accum / accumulation_steps
+            micro_loss_accum = 0.0
+            num_steps += 1
+
+    return running_loss / max(1, num_steps)
 
 
-def validate_one_epoch(
-        epoch: int, 
-        val_loader: DataLoader, 
-        clip_model: CLIP, 
-        clip_preprocess: nn.Transformer, 
-        image_loader: ImageLoader, 
-        optimizer=None, 
-        scheduler=None
-    ) -> Tuple[float, float]:
-    """
-    Validate the model on the validation set.
+def validate_epoch(
+        epoch: int,
+        val_loader: DataLoader,
+        model: Module,
+        clip_preprocess,
+        image_loader: ImageLoader,
+        loss_func: str,
+        save_path: str,
+        margin=1.0,
+        description='word',
+        use_amp: bool = False,
+):
+    model.eval()
+    model.to(device)
 
-    args:
-        epoch (int): Current epoch number.
-        val_loader (DataLoader): Validation DataLoader.
-        clip_model (nn.Module): CLIP model.
-        clip_preprocess (nn.Transformer): CLIP preprocess model.
-        image_loader (ImageLoader): Image loader.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        scheduler (torch.optim.lr_scheduler): Learning rate scheduler.
+    total_loss = 0.0
+    num_batches = 0
 
-    returns:
-        val_loss (float): Validation loss.
-        val_accuracy (float): Validation accuracy.
-    """
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp and torch.cuda.is_available()
+        else contextlib.nullcontext()
+    )
 
-    global device
+    with torch.no_grad(), autocast_ctx:
+        for batch in val_loader:
+            *_, image_names, _, words = batch
 
-    clip_model.eval()
-    val_loss = 0.0
-    val_accuracy = 0.0
-    total_samples = 0
+            # Build images + descriptions
+            images = [image_loader(img_name) for img_name in image_names]
 
-    # Validation loop
-    with torch.no_grad():
-        val_bar = tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}", position=1, leave=True)
+            if description == 'word':
+                descriptions = words
+            elif description == 'description':
+                descriptions = [get_phosc_description(w) for w in words]
+            elif description == 'phosc_number':
+                descriptions = [get_phosc_number_description(w) for w in words]
+            elif description == 'description_long':
+                descriptions = [get_phosc_description(w) for w in words]
+            else:
+                raise ValueError('Invalid description')
 
-        # Iterate over the validation set
-        for batch in val_bar:
-            *_, image_names, _, descriptions = batch
+            # Deterministic label mapping (avoid unordered set)
+            uniq = sorted(set(words))
+            w2i = {w: i for i, w in enumerate(uniq)}
+            class_labels = torch.tensor([w2i[w] for w in words], device=device, dtype=torch.long)
 
-            # Preprocess images
-            images = [clip_preprocess(image_loader(img_name)).unsqueeze(0).to(device) for img_name in image_names]
-            images = torch.cat(images, dim=0)
+            # Preprocess images for CLIP
+            processed_images = preprocess_clip_batch(clip_preprocess, images, descriptions).to(device)
 
             # Encode images
-            images_enc = clip_model.encode_image(images)
+            image_features = model.encode_image(processed_images)
+            image_features = F.normalize(image_features, dim=1)
 
-            # Process and encode descriptions
-            descriptions_enc = torch.stack([gen_word_objs_embeddings(description, clip_model) for description in descriptions]).squeeze(1)
+            # Encode text
+            text_features = torch.stack([gen_word_objs_embeddings(desc, model) for desc in descriptions])
+            text_features = F.normalize(text_features.squeeze(1), dim=1)
 
-            # Compute similarity scores between images and texts
-            image_logits = images_enc @ descriptions_enc.t()
-            ground_truth = torch.arange(len(image_logits)).long().to(device)
+            # Compute similarity logits
+            logits_per_image = image_features @ text_features.t() * model.logit_scale.exp()
+            logits_per_text = logits_per_image.t()
 
-            # Calculate loss
-            loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
-            val_loss += loss.item() * images.size(0)
-            total_samples += images.size(0)
+            # Loss
+            if loss_func == 'triplet':
+                loss = compute_triplet_margin_loss(logits_per_image, class_labels, margin)
+            elif loss_func == 'contrastive':
+                loss = compute_contrastive_loss(logits_per_image, class_labels, margin)
+            elif loss_func == 'simple':
+                loss = simple_loss(logits_per_image)
+            elif loss_func == 'supcon':
+                loss = supcon_infonce_from_logits(logits_per_image,
+                                                  logits_per_text,
+                                                  class_labels,
+                                                  symmetric=True)
+            else:
+                raise ValueError('Invalid loss function')
 
-            # Calculate accuracy
-            acc_i = (torch.argmax(image_logits, 1) == ground_truth).sum()
-            acc_t = (torch.argmax(image_logits, 0) == ground_truth).sum()
-            val_accuracy += (acc_i + acc_t).float().item() / 2
+            total_loss += float(loss.item())
+            num_batches += 1
 
-            val_bar.set_description(f"Validation Epoch {epoch + 1} Loss: {loss.item():.4f}")
-
-        # Compute average loss and accuracy
-        val_loss /= total_samples
-        val_accuracy /= total_samples
-
-    # Logging validation loss and accuracy
-    print(f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
-
-    if optimizer:
-        optimizer.step()
-
-    if scheduler:
-        scheduler.step(val_loss)
-
-    return val_loss, val_accuracy
+    return total_loss / max(1, num_batches)
 
 
-def main(args=None) -> Tuple[float, CLIP, nn.Transformer]:
+def main(_args=None):
+    print(f'{device}')
+
     parser = argparse.ArgumentParser()
 
-    # Add arguments
     parser = clip_fine_tune_argparse(parser)
+    parser = phosc_net_argparse(parser)
     parser = dataset_argparse(parser)
     parser = early_stopper_argparse(parser)
-    parser = phosc_net_argparse(parser)
+    parser = optimizer_argparse(parser)
+    parser = lr_scheduler_argparse(parser)
+    parser = checkpoint_argparse(parser)
+    parser = slurm_argparse(parser)
+    parser = loss_func_argparse(parser)
+    parser = training_common_argparse(parser)
 
     # Parse arguments
-    if args is None:
+    if _args is None:
         args = parser.parse_args()
     else:
-        args = parser.parse_args(args)
+        args = parser.parse_args(_args)
 
-    # Define patchs
-    root_dir = ospj(DATA_FOLDER, "BengaliWords", "BengaliWords_CroppedVersion_Folds")
-    image_loader_path = ospj(root_dir, args.split_name)
-
-    root_model_path = ospj('models', 'fine-tuned_clip', args.split_name)
-    log_file_path = ospj(root_model_path, 'training_log.log')
-    model_save_path = ospj(root_model_path, 'simple', 'model.pth')
-
-    verify_model_save_path(model_save_path)
-
-    setup_logging(log_file_path)
-
-    # Set up models
+    # CLIP model
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
     clip_model.float()
+    clip_model.to(device)
+
+    # Make logit_scale trainable (CLIP exposes this as a Parameter)
+    if hasattr(clip_model, "logit_scale") and isinstance(clip_model.logit_scale, torch.nn.Parameter):
+        clip_model.logit_scale.requires_grad_(True)
 
     # Load phosc model
     phosc_model = get_phoscnet(args, device)
 
-    # Load datasets
-    train_loader, train_set = get_training_loader(args)
-    validation_loader, _ = get_validation_loader(args)
+    train_loader, train_set = get_training_loader(args, phosc_model)
+    validation_loader, _ = get_validation_loader(args, phosc_model)
+    # test_loader, _ = get_test_loader(args, phosc_model)
 
-    # Define image loader
-    loader = ImageLoader(image_loader_path)
+    image_loader = ImageLoader(ospj(DATA_FOLDER, args.data_dir, args.split_name))
 
-    # Fine-tuning
-    """
-    optimizer = torch.optim.RMSprop(
-        clip_model.parameters(), 
-        lr=args.lr,
-        eps=args.eps,
-        weight_decay=args.weight_decay
-    ) 
-    """
+    optimizer = None
+    lr_scheduler = None
 
-    optimizer = torch.optim.AdamW(
-        clip_model.parameters(),
-        lr=args.lr,
-        eps=args.eps,
-        weight_decay=args.weight_decay
-    )
+    save_path = ospj(args.save_dir, args.name, args.split_name)
 
-    # Learning rate scheduler   
-    decay_lr_schedule_fn = create_learning_rate_fn(
-        optimizer,
-        len(train_set),
-        args.batch_size,
-        args.epochs,
-        args.warmup_steps,
-        args.lr,
-        linear=False,  # set False to activate cosine annealing
-    )
+    print(f'{args.maximize=}')
 
-    # Early stopping
+    # Select optimizer
+    if args.optimizer == 'lamb' or args.optimizer == 'adam':
+        optimizer = Lamb(
+            clip_model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            adam=True if args.optimizer == 'adam' else False,
+            maximize=args.maximize,
+        )
+    elif args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(
+            clip_model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    elif args.optimizer == 'none':
+        optimizer = None
+    else:
+        raise ValueError('Invalid optimizer')
+
+    # Select learning rate scheduler
+    if args.lr_scheduler == 'cosine':
+        lr_scheduler = create_cosine_annealing_lr_scheduler(optimizer, T_0=10)
+    elif args.lr_scheduler == 'cosine_warmup':
+        lr_scheduler = create_learning_rate_fn(
+            optimizer,
+            len(train_set),
+            args.batch_size,
+            args.epochs,
+            args.warmup_steps,
+            args.lr,
+            linear=False,  # set False to activate cosine annealing
+        )
+    elif args.lr_scheduler == 'linear':
+        lr_scheduler = create_learning_rate_fn(
+            optimizer,
+            len(train_set),
+            args.batch_size,
+            args.epochs,
+            args.warmup_steps,
+            args.lr,
+            linear=True,
+        )
+    elif args.lr_scheduler == 'exploration':
+        lr_scheduler = ExplorationOptimizationScheduler(
+            optimizer,
+            patience=args.lr_patience,
+            threshold=args.lr_threshold,
+            reduction_factor=args.lr_reduction_factor,
+            exploration_factor=args.lr_exploration_factor,
+        )
+    elif args.lr_scheduler == 'none':
+        lr_scheduler = None
+
+    # Load checkpoint if there is any
+    if args.ignore_checkpoint:
+        start_epoch = 1
+        best_loss = float('-inf') if args.maximize else float('inf')
+    else:
+        print('Loading checkpoint')
+        checkpoint_path = save_path if args.checkpoint_path == None else args.checkpoint_path
+        start_epoch, best_loss = load_checkpoint(checkpoint_path, clip_model, optimizer, lr_scheduler,
+                                                 maximize=args.maximize)
+
     early_stopping = EarlyStopping(
-        save_path=ospj('models', 'fine-tuned_clip', args.split_name, args.name),
+        save_path=save_path,
+        loss=best_loss,
         patience=args.stop_patience,
         verbose=args.verbose,
         save_every=args.save_every,
         model_arguments=args,
-        save=args.save
+        model_argument_parser=parser,
+        save=args.save,
+        maximize=args.maximize,
+        validate=args.validate
     )
 
-    for epoch in range(args.epochs):
-        train_loss = train_one_epoch(
-            epoch,
-            train_loader,
-            clip_model,
-            loader,
-            args.batch_size,
+    # Save slurm job to model folder
+    create_file_with_job_id(save_path, args.slurm_job_id, args.slurm_job_desc)
+
+    # (re)build LR scheduler for gradient accumulation
+    if args.lr_scheduler in {'cosine_warmup', 'linear'}:
+        lr_scheduler = make_accum_scheduler(
             optimizer,
-            decay_lr_schedule_fn,
-            args.margin
+            len_train_loader=len(train_loader),
+            accumulation_steps=args.accumulation_steps,
+            num_epochs=args.epochs - (start_epoch - 1),
+            warmup_steps=args.warmup_steps,
+            linear=(args.lr_scheduler == 'linear'),
         )
-
-        """
-        val_loss, val_acc = validate_one_epoch(
-            epoch,
-            validation_loader,
-            clip_model,
-            clip_preprocess,
-            loader,
-            decay_lr_schedule_fn
+    elif args.lr_scheduler == 'cosine':
+        # CosineAnnealingWarmRestarts works in "steps"; set T_0 in optimizer-steps:
+        steps_per_epoch = math.ceil(len(train_loader) / args.accumulation_steps)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=steps_per_epoch * 10, T_mult=1, eta_min=0
         )
-        """
-
-        if early_stopping(train_loss, clip_model, epoch):
-            return early_stopping.best_score, clip_model, early_stopping.best_model_path
-    
+    elif args.lr_scheduler == 'exploration':
+        lr_scheduler = ExplorationOptimizationScheduler(
+            optimizer,
+            patience=args.lr_patience,
+            threshold=args.lr_threshold,
+            reduction_factor=args.lr_reduction_factor,
+            exploration_factor=args.lr_exploration_factor,
+        )
     else:
-        """
-        print('Training completed')
-        print(f'Best validation loss: {early_stopping.best_score}')
-        print(f'Best model saved at: {early_stopping.best_model_path}')
-        """
-        
-        return early_stopping.best_score, clip_model, early_stopping.best_model_path
+        lr_scheduler = None
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_loss = train_epoch(
+            epoch=epoch,
+            train_loader=train_loader,
+            model=clip_model,
+            clip_preprocess=clip_preprocess,
+            image_loader=image_loader,
+            loss_func=args.loss_func,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            margin=args.margin,
+            accumulation_steps=args.accumulation_steps,
+            description=args.description,
+            save_path=early_stopping.save_path,
+        )
+
+        val_loss = 0
+
+        if args.validate:
+            val_loss = validate_epoch(
+                epoch=epoch,
+                val_loader=validation_loader,
+                model=clip_model,
+                clip_preprocess=clip_preprocess,
+                image_loader=image_loader,
+                loss_func=args.loss_func,
+                margin=args.margin,
+                description=args.description,
+                save_path=early_stopping.save_path,
+            )
+
+        if early_stopping(train_loss, val_loss, clip_model, epoch):
+            return early_stopping.min_loss, early_stopping.best_model_path
+
+    return early_stopping.min_loss, early_stopping.best_model_path
 
 
 if __name__ == '__main__':
     try:
-        main()
+        best_score, best_model_path = main()
+
+        print(f'Best model validation loss: {best_score}')
+        print(f'Best model path: {best_model_path}')
+
     except KeyboardInterrupt:
         print('Ctrl-C exit')

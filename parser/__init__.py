@@ -1,3 +1,5 @@
+from .loss_func_argparse import loss_func_argparse
+from .training_common_argparse import training_common_argparse
 from .train_clip_argparse import train_clip_argparse
 from .phosc_net_argparse import phosc_net_argparse
 from .dataset_argparse import dataset_argparse

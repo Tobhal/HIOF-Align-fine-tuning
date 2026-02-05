@@ -12,4 +12,9 @@
 # module load python3
 
 # Execute the script
-python matrix_new.py --split_name fold_3_aug_square --nums 23 24 --heatmap
+python matrix_new.py \
+  --split_name fold_3_aug_square \
+  --nums 2 3 4 \
+  --heatmap \
+  --save_name "clip-fine-tune"
+  #--save_name "align-fine-tune"

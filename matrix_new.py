@@ -46,7 +46,16 @@ from transformers import (
 )
 
 from utils.get_dataset import get_test_loader, get_phoscnet
-from parser import phosc_net_argparse, dataset_argparse, aling_fine_tune_argparse, matrix_new_argparse
+from parser import (
+    dataset_argparse,
+    phosc_net_argparse,
+    aling_fine_tune_argparse,
+    matrix_new_argparse,
+    clip_fine_tune_argparse,
+    loss_func_argparse,
+    training_common_argparse,
+)
+
 
 # -----------------------
 # Globals / Preprocessing
@@ -55,13 +64,13 @@ split = 'fold_0_t'
 use_augmented = False
 
 # ALIGN (HF): processor can batch images (and texts). We'll use AutoProcessor for images below.
-align_processor = AlignProcessor.from_pretrained("kakaobrain/align-base")
-align_model = AlignModel.from_pretrained("kakaobrain/align-base")
-align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
-align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
+# align_processor = AlignProcessor.from_pretrained("kakaobrain/align-base")
+# align_model = AlignModel.from_pretrained("kakaobrain/align-base")
+# align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
+# align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
 
 # (Kept for completeness; not used in this matrix script)
-clip_preprocess = Compose([
+clip_preprocess_default = Compose([
     Resize(224, interpolation=Image.BICUBIC),
     CenterCrop(224),
     ToTensor(),
@@ -228,6 +237,7 @@ def collect_image_features_align(
 Encode ALL images from dataloader with ALIGN, L2-normalize, and return [N, D] features.
 Assumes batches yield something like: (*_, image_paths, _, _)
     """
+    align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
     model.eval()
     feats = []
     for batch in tqdm(dataloader, desc="Collecting image features"):
@@ -254,6 +264,36 @@ Assumes batches yield something like: (*_, image_paths, _, _)
 
 
 @torch.no_grad()
+def collect_image_features_clip(
+        model: nn.Module,
+        dataloader: DataLoader,
+        image_loader: ImageLoader,
+        preprocess,
+        device: str
+) -> torch.Tensor:
+    """
+Encode ALL images from dataloader with CLIP, L2-normalize, and return [N, D] features.
+    """
+    model.eval()
+    feats = []
+    for batch in tqdm(dataloader, desc="Collecting CLIP image features"):
+        try:
+            *_, img_paths, _, _ = batch
+        except Exception as e:
+            raise RuntimeError("Expected batch like (*_, image_paths, _, _).") from e
+
+        pil_images = [image_loader(p) for p in img_paths]
+        images = torch.stack([preprocess(img) for img in pil_images]).to(device)
+
+        f = model.encode_image(images)
+        f = F.normalize(f, dim=-1)
+        feats.append(f)
+
+    feats = torch.cat(feats, dim=0)
+    return feats
+
+
+@torch.no_grad()
 def cosine_similarity_matrix(feats: torch.Tensor) -> torch.Tensor:
     """
 Compute N×N cosine similarity matrix from L2-normalized features [N, D].
@@ -274,6 +314,7 @@ def collect_text_features_align(
     """
 Encode a list of texts with ALIGN, L2-normalize, return [N, D].
     """
+    align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
     model.eval()
     out = []
     # Batch in chunks to avoid OOM if texts is huge
@@ -286,6 +327,27 @@ Encode a list of texts with ALIGN, L2-normalize, return [N, D].
         f = F.normalize(f, dim=-1)
         out.append(f)
     return torch.cat(out, dim=0)  # [N, D]
+
+
+@torch.no_grad()
+def collect_text_features_clip(
+        model: nn.Module,
+        texts: List[str],
+        device: str
+) -> torch.Tensor:
+    """
+Encode a list of texts with CLIP, L2-normalize, return [N, D].
+    """
+    model.eval()
+    out = []
+    B = 512
+    for i in range(0, len(texts), B):
+        chunk = texts[i:i + B]
+        text_tokens = clip.tokenize(chunk).to(device)
+        f = model.encode_text(text_tokens)
+        f = F.normalize(f, dim=-1)
+        out.append(f)
+    return torch.cat(out, dim=0)
 
 
 # -----------------------
@@ -302,16 +364,33 @@ def print_results(results: List[Result]):
 def main(args=None, model=None, index=0) -> List[Result]:
     parser = argparse.ArgumentParser()
 
-    parser = matrix_new_argparse(parser)
-    parser = phosc_net_argparse(parser)
     parser = dataset_argparse(parser)
+    parser = matrix_new_argparse(parser)
+    parser = clip_fine_tune_argparse(parser)
     parser = aling_fine_tune_argparse(parser)
+    parser = phosc_net_argparse(parser)
+    parser = loss_func_argparse(parser)
+    parser = training_common_argparse(parser)
 
     # Parse args
     if args is None:
         args = parser.parse_args()
     else:
         args = parser.parse_args(args)
+
+    print(args.save_name)
+
+    # Decide which model type we are using
+    if args.save_name == 'clip-fine-tune':
+        print("clip")
+        model_type = 'CLIP'
+    elif args.save_name == 'align-fine-tune':
+        print("align")
+        model_type = 'ALIGN'
+    else:
+        # Fallback or error; based on issue description, these are the two expected values.
+        # We can default to ALIGN if it's not clip_fine_tune.
+        model_type = 'ALIGN'
 
     # Dataset / loader
     # NOTE: Adapt this root_dir to your actual project layout
@@ -323,14 +402,28 @@ def main(args=None, model=None, index=0) -> List[Result]:
     results = []
 
     for num in args.nums:
-        model_dir = ospj(args.save_dir, args.name, args.split_name, str(num))
+        model_dir = ospj(args.save_dir, args.save_name, args.split_name, str(num))
         ckpt_path = ospj(model_dir, args.checkpoint_name)
 
-        # Load the fine-tuned ALIGN model
-        align_fine_tuned_model = AlignModel.from_pretrained("kakaobrain/align-base").to(device).eval()
-        if args.model_source == 'fine-tuned':
-            state = torch.load(ckpt_path, map_location=device)
-            align_fine_tuned_model.load_state_dict(state, strict=True)
+        if model_type == 'ALIGN':
+            print(f"Loading ALIGN model from {ckpt_path}")
+            # Load the fine-tuned ALIGN model
+            fine_tuned_model = AlignModel.from_pretrained("kakaobrain/align-base").to(device).eval()
+            if args.model_source == 'fine-tuned':
+                state = torch.load(ckpt_path, map_location=device)
+                fine_tuned_model.load_state_dict(state, strict=True)
+            preprocess = None # ALIGN uses its own processor inside collection funcs
+        else:
+            print(f"Loading CLIP model from {ckpt_path}")
+            # Load the fine-tuned CLIP model
+            fine_tuned_model, preprocess = clip.load("ViT-B/32", device=device)
+            fine_tuned_model = fine_tuned_model.float().eval()
+            if args.model_source == 'fine-tuned':
+                state = torch.load(ckpt_path, map_location=device)
+                # CLIP checkpoints often contain the state_dict directly or under a key
+                if isinstance(state, dict) and 'model_state_dict' in state:
+                    state = state['model_state_dict']
+                fine_tuned_model.load_state_dict(state, strict=True)
 
         if args.evaluate == 'text':
             # If you really want text–text: collect all words from the loader
@@ -342,10 +435,20 @@ def main(args=None, model=None, index=0) -> List[Result]:
                     raise RuntimeError("Expected words in batch at position -1.") from e
                 all_words.extend(list(words))
 
-            feats = collect_text_features_align(align_fine_tuned_model, all_words, device)
+            if model_type == 'ALIGN':
+                print(f"Collecting text features for ALIGN model")
+                feats = collect_text_features_align(fine_tuned_model, all_words, device)
+            else:
+                print(f"Collecting text features for CLIP model")
+                feats = collect_text_features_clip(fine_tuned_model, all_words, device)
         else:
             # Default: image–image matrix
-            feats = collect_image_features_align(align_fine_tuned_model, test_loader, image_loader, device)
+            if model_type == 'ALIGN':
+                print(f"Collecting image features for ALIGN model")
+                feats = collect_image_features_align(fine_tuned_model, test_loader, image_loader, device)
+            else:
+                print(f"Collecting image features for CLIP model")
+                feats = collect_image_features_clip(fine_tuned_model, test_loader, image_loader, preprocess, device)
 
         # Cosine similarity matrix (vectorized)
         S = cosine_similarity_matrix(feats)  # [N, N], cosine in [-1, 1]
@@ -366,7 +469,7 @@ def main(args=None, model=None, index=0) -> List[Result]:
             save_heatmap(
                 S,
                 heatmap_path,
-                title=f"ALIGN cosine similarity (model {num})",
+                title=f"{model_type} cosine similarity (model {num})",
                 vmin=-1.0, vmax=1.0,
                 cmap=args.cmap,
                 dpi=300,
@@ -383,5 +486,6 @@ def main(args=None, model=None, index=0) -> List[Result]:
 
 
 if __name__ == '__main__':
-    results = main(model=align_model)
+    # Defaulting to no specific model here as main handles loading now
+    results = main()
     print_results(results)
