@@ -1,76 +1,76 @@
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
+from __future__ import annotations
 
-from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-
-import logging
-
-from PIL import Image
-
-import clip
+from utils.get_dataset import get_phoscnet, get_test_loader
+from data.dataset_bengali import ImageLoader
 
 import os
 from os import PathLike
 from os.path import join as ospj
-
-from typing import List, Tuple
 from dataclasses import dataclass
-
-from timm import create_model
-
-from tqdm import tqdm
-
-from flags import DATA_FOLDER, device
-
-from utils.dbe import dbe
-from utils.utils import clip_text_features_from_description
-
-from data import dataset_bengali as dset
-from data.dataset_bengali import ImageLoader
-
-from modules.utils import set_phos_version, set_phoc_version, gen_shape_description
-from modules.utils.utils import split_string_into_chunks, get_phosc_description
-
-from modules import models, residualmodels
-
-import numpy as np
-import pandas as pd
-
-from torchvision import transforms
-
-from transformers import AlignProcessor, AlignModel, AutoTokenizer, AutoProcessor, AlignTextModel, AlignConfig
 from enum import Enum
-
-from utils.get_dataset import get_test_loader, get_phoscnet
+from typing import List, Tuple
 
 import argparse
-from parser import phosc_net_argparse, dataset_argparse, aling_fine_tune_argparse, matrix_argparse
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from PIL import Image
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from timm import create_model
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless-safe
+import matplotlib.pyplot as plt
+import numpy as np
+
+# (You keep these if other parts of your project import them)
+from flags import DATA_FOLDER, device
+from data.dataset_bengali import ImageLoader
+from utils.dbe import dbe
+
+# Optional/legacy imports kept for compatibility
+import clip
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from torchvision import transforms
+
+from transformers import (
+    AlignProcessor,
+    AlignModel,
+    AutoTokenizer,
+    AutoProcessor,
+)
+
+from utils.get_dataset import get_test_loader, get_phoscnet
+from parser import (
+    dataset_argparse,
+    phosc_net_argparse,
+    aling_fine_tune_argparse,
+    matrix_new_argparse,
+    clip_fine_tune_argparse,
+    loss_func_argparse,
+    training_common_argparse,
+)
+
+
+# -----------------------
+# Globals / Preprocessing
+# -----------------------
 split = 'fold_0_t'
 use_augmented = False
 
-# align model
-align_processor = AlignProcessor.from_pretrained("kakaobrain/align-base")
-align_model = AlignModel.from_pretrained("kakaobrain/align-base")
-align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
-align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
-# align_text_model = AlignTextModel.from_pretrained("kakaobrain/align-base")
+# ALIGN (HF): processor can batch images (and texts). We'll use AutoProcessor for images below.
+# align_processor = AlignProcessor.from_pretrained("kakaobrain/align-base")
+# align_model = AlignModel.from_pretrained("kakaobrain/align-base")
+# align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
+# align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
 
-
-# Create a new configuration with a larger maximum sequence length
-# config = AlignConfig.from_pretrained("kakaobrain/align-base", max_position_embeddings=2048)
-
-# Create a new model with the updated configuration
-# align_text_model = AlignTextModel(config)
-
-# save_path = ospj('models', 'fine-tuned_clip', split)
-save_path = ospj('models', 'align-fine-tune', split)
-matrix_save_path = ospj(save_path, 'matrix')
-
-# Preprocessing for CLIP
-clip_preprocess = Compose([
+# (Kept for completeness; not used in this matrix script)
+clip_preprocess_default = Compose([
     Resize(224, interpolation=Image.BICUBIC),
     CenterCrop(224),
     ToTensor(),
@@ -78,6 +78,114 @@ clip_preprocess = Compose([
 ])
 
 
+def _downsample_matrix_avgpool(M: torch.Tensor, block: int = 1) -> torch.Tensor:
+    """
+Downsample a square matrix by average pooling (block x block).
+Drops leftover rows/cols if N is not divisible by block.
+    """
+    if block <= 1:
+        return M
+    if torch.is_tensor(M):
+        X = M
+    else:
+        X = torch.tensor(M, dtype=torch.float32)
+
+    # keep square assumption; trim edges if needed
+    N = X.shape[0]
+    trim = N - (N // block) * block
+    if trim > 0:
+        X = X[:-trim, :-trim]
+
+    X = X.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    X = F.avg_pool2d(X, kernel_size=block, stride=block, ceil_mode=False)
+    return X.squeeze(0).squeeze(0)  # [H', W']
+
+
+# -----------------------------
+# Heatmap saver (vectorized)
+# -----------------------------
+def save_heatmap(
+        S: torch.Tensor,
+        out_path: str,
+        title: str | None = None,
+        vmin: float = -1.0,
+        vmax: float = 1.0,
+        cmap: str = "coolwarm",
+        dpi: int = 300,
+        cell_px: int = 3,
+        max_width_px: int | None = 1800,
+        tick_step: int | None = None,
+        add_colorbar: bool = True,
+        downsample_block: int = 1,
+):
+    """
+Save a cosine-similarity heatmap for S (N x N), with crisp cells and small squares for N~300-400.
+
+- cell_px sets size of each cell in pixels before capping by max_width_px.
+- If max_width_px is set, cell size is reduced to keep figure at/below that width.
+- vmin/vmax fix the color scale (important when comparing different runs).
+- downsample_block>1 will average-pool the matrix (e.g., 2, 4, 8) for a smaller overview.
+
+    """
+    # Downsample if requested
+    if downsample_block and downsample_block > 1:
+        S = _downsample_matrix_avgpool(S, downsample_block)
+
+    # Move to CPU numpy
+    if torch.is_tensor(S):
+        S_np = S.detach().cpu().numpy()
+    else:
+        S_np = np.asarray(S)
+    N = S_np.shape[0]
+
+    # Determine figure size from desired pixels per cell
+    width_px = N * cell_px
+    if max_width_px is not None and width_px > max_width_px:
+        cell_px = max(1, max_width_px // max(1, N))
+        width_px = N * cell_px
+
+    fig_w_in = max(3.0, width_px / dpi)  # keep at least 3 inches for readability
+    fig_h_in = fig_w_in
+
+    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), constrained_layout=True)
+    # imshow is the recommended fast path for raster heatmaps on regular grids
+    im = ax.imshow(
+        S_np,
+        vmin=vmin, vmax=vmax,  # fixed normalization for cosine [-1,1]
+        cmap=cmap,
+        interpolation="nearest",  # no smoothing; crisp cells
+        aspect="equal",
+    )
+
+    if add_colorbar:
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.set_ylabel("cosine similarity", rotation=270, labelpad=12)
+
+    ax.set_title(title or f"Cosine similarity (N={N})", fontsize=10)
+    ax.set_xlabel("image index")
+    ax.set_ylabel("image index")
+
+    # Ticks: off by default for large N; enable sparse ticks with tick_step
+    if tick_step and tick_step > 0:
+        idx = np.arange(0, N, tick_step)
+        ax.set_xticks(idx)
+        ax.set_yticks(idx)
+        ax.tick_params(axis="both", which="both", labelsize=6, length=0)
+    else:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Heatmap saved at: {out_path}")
+
+
+# -----------------------
+# Data classes / results
+# -----------------------
 @dataclass
 class Result:
     model_number: int
@@ -86,35 +194,26 @@ class Result:
     average_value: float
 
 
+# -----------------------
+# I/O: save the matrix
+# -----------------------
 def save_matrix(matrix: torch.Tensor, results: Result, _model_save_path: PathLike, csv_filename="matrix"):
     """
-Save the given matrix as a CSV file.
-
-args:
-matrix: The matrix to save
-results (Result): The results of the evaluation
-model_save_path (PathLike): The path to save the matrix
-csv_filename (str): The name of the CSV file to save
+Save the given matrix as CSV and a small text summary next to it.
     """
-    # Extract the directory from the model save path
     directory = os.path.dirname(_model_save_path)
-
-    # Ensure the directory exists
     if not os.path.exists(directory):
-        os.makedirs(directory)
+        os.makedirs(directory, exist_ok=True)
 
-    # Create the full path for the CSV file
     csv_path = ospj(directory, f'{csv_filename}.csv')
     txt_path = ospj(directory, f'{csv_filename}.txt')
 
     if torch.is_tensor(matrix):
-        matrix = matrix.cpu().numpy()
+        matrix = matrix.detach().cpu().numpy()
 
-    # Convert the matrix to a DataFrame and save as CSV
     df = pd.DataFrame(matrix)
     df.to_csv(csv_path, index=False, header=False)
 
-    # Save the results to a text file
     with open(txt_path, 'w') as f:
         f.write(f"Model number: {results.model_number}\n")
         f.write(f"Minimum value in matrix: {results.min_value}\n")
@@ -124,330 +223,269 @@ csv_filename (str): The name of the CSV file to save
     print(f"Matrix saved at: {csv_path}")
 
 
-def calculate_cos_angle_matrix(vector: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate the cosine angle matrix for the given vectors.
-
-    args:
-        vectors (torch.Tensor): The vectors to calculate the cosine angle matrix for
-
-    returns:
-        cos_angle_matrix (torch.Tensor): The cosine angle matrix for the given vectors
-    """
-    n = len(vector)
-    cos_angle_matrix = torch.zeros((n, n))
-
-    for i in range(n):
-        for j in range(n):
-            # Convert vectors to PyTorch tensors if they aren't already
-            vec_i = vector[i]
-            vec_j = vector[j]
-
-            # Calculate the dot product of the two vectors
-            try:
-                dot_product = torch.matmul(vec_i, vec_j)
-            except RuntimeError as e:
-                dbe(vec_i.shape, vec_j.shape, e)
-
-            # Calculate the magnitudes of the vectors
-            magnitude_i = torch.norm(vec_i)
-            magnitude_j = torch.norm(vec_j)
-
-            # Calculate the cosine of the angle
-            cos_theta = dot_product / (magnitude_i * magnitude_j)
-
-            # Ensure the cosine value is within the valid range [-1, 1]
-            # cos_theta = torch.clamp(cos_theta, -1, 1)
-
-            # Assign the cosine value to the matrix
-            cos_angle_matrix[i, j] = cos_theta
-
-    return cos_angle_matrix
-
-
-class ModelType(Enum):
-    """
-    Enum class for the type of model to evaluate.
-    """
-    CLIP = "CLIP"
-    ALIGN = "ALIGN"
-
-
-def compute_loss_and_accuracy(
-        images_enc: torch.Tensor,
-        descriptions_enc: torch.Tensor,
-        image_names: List[str],
-        device: str
-) -> Tuple[float, float]:
-    """
-    Compute the loss and accuracy for the given images and descriptions.
-
-    args:
-        images_enc (torch.Tensor): The encoded images
-        descriptions_enc (torch.Tensor): The encoded descriptions
-        image_names (List[str]): The names of the images
-        device (str): The device to use for evaluation
-    
-    returns:
-        loss (float): The loss for the batch
-        accuracy (float): The accuracy for the batch
-    """
-    # Compute loss and accuracy for validation metrics
-    image_logits = images_enc @ descriptions_enc.t()
-    ground_truth = torch.arange(len(image_logits)).long().to(device)
-    loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
-
-    # Calculate accuracy
-    acc_i = (torch.argmax(image_logits, 1) == ground_truth).sum()
-    acc_t = (torch.argmax(image_logits, 0) == ground_truth).sum()
-    accuracy = (acc_i + acc_t).float() / 2 / len(image_names)
-
-    return loss.item(), accuracy.item()
-
-
-def clip_process_and_evaluate_batch(
-        image_names: List[str],
-        descriptions: List[str],
-        model: nn.Module,
-        preprocess: nn.Transformer,
-        loader: ImageLoader,
-        device: str
-) -> Tuple[List[float], List[float]]:
-    """
-    Process the images and descriptions in the batch and evaluate the model.
-
-    args:
-        image_names (List[str]): The names of the images in the batch
-        descriptions (List[str]): The descriptions for the images in the batch
-        model (nn.Module): The model to evaluate
-        preprocess (nn.Transformer): The preprocessing function to apply to the images
-        loader (ImageLoader): The image loader to use for loading the images
-        device (str): The device to use for evaluation
-
-    returns:
-        losses (List[float]): The losses for the batch
-        accuracy (List[float]): The accuracy for the batch
-    """
-    # Process images
-    images = [preprocess(loader(img_name)).unsqueeze(0).to(device) for img_name in image_names]
-    images = torch.cat(images, dim=0)
-
-    # Precompute embeddings for all descripdtions in the batch
-    descriptions_enc = torch.stack(
-        [clip_text_features_from_description(description, model) for description in descriptions]).squeeze(1)
-
-    # Encode images using the model
-    images_enc = model.encode_image(images)
-
-    # Calculate cosine similarity between each image and text features in the batch
-    similarity_matrix = torch.nn.functional.cosine_similarity(images_enc.unsqueeze(1), descriptions_enc.unsqueeze(0),
-                                                              dim=2)
-    similarities = similarity_matrix.diag().cpu().tolist()
-
-    return compute_loss_and_accuracy(images_enc, descriptions_enc, image_names, device)
-
-
-def align_process_and_evaluate_batch(
-        image_names: List[str],
-        descriptions: List[str],
-        model: nn.Module,
-        transform: nn.Transformer,
-        loader: ImageLoader,
-        device: str
-) -> Tuple[List[float], List[float]]:
-    """
-    Process the images and descriptions in the batch and evaluate the model.
-
-    args:
-        image_names (List[str]): The names of the images in the batch
-        descriptions (List[str]): The descriptions for the images in the batch
-        model (nn.Module): The model to evaluate
-        transform (nn.Transform): The transformation to apply to the images
-        device (str): The device to use for evaluation
-
-    returns:
-        losses (List[float]): The losses for the batch
-        accuracy (List[float]): The accuracy for the batch
-    """
-    images = [loader(img_name) for img_name in image_names]
-    losses = []
-    accuracy = []
-
-    # Process images and descriptions
-    for image, description in zip(images, descriptions):
-        processor_inputs = align_auto_processor(image=image, return_tensors="pt")
-        text_input = align_auto_tokenizer(description, return_tensors="pt")
-
-        # Get image and text features
-        image_features = model.get_image_features(**processor_inputs)
-        text_features = model.get_text_features(**text_input)
-
-        # Compute similarity scores between images and texts
-        loss, acc = compute_loss_and_accuracy(image_features, text_features, image_names, device)
-
-        losses.append(loss)
-        accuracy.append(acc)
-
-    return losses, accuracy
-
-
-def evaluate_model_batch(
+# ----------------------------------------
+# Cosine matrix helpers (vectorized & fast)
+# ----------------------------------------
+@torch.no_grad()
+def collect_image_features_align(
         model: nn.Module,
         dataloader: DataLoader,
-        loader: ImageLoader,
-        device: str,
-        model_type: ModelType,
-) -> Tuple[float, float, List[float]]:
-    """
-    Evaluate the model on the given dataloader and return the average loss and accuracy.
-
-    args:
-        model (nn.Module): The model to evaluate
-        dataloader (DataLoader): The dataloader to use for evaluation
-        device (str): The device to use for evaluation
-        model_type (ModelType): The type of model to evaluate
-
-    returns:
-        avg_loss (float): The average loss for the model
-        avg_accuracy (float): The average accuracy for the model
-        similarities (List[Float]): The cosine similarities between images and text features
-    """
-    model.eval()
-    similarities = []
-    losses = []
-    accuracies = []
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-    ])
-
-    # Evaluate the model on the given dataloader
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            *_, image_names, _, descriptions = batch
-
-            # Process the batch based on the model type
-            if model_type == ModelType.CLIP:
-                clip_process_and_evaluate_batch(image_names, descriptions, model, clip_preprocess, loader, device)
-            elif model_type == ModelType.ALIGN:
-                align_process_and_evaluate_batch(image_names, descriptions, model, transform, loader, device)
-
-    # Calculate the average loss and accuracy
-    avg_loss = sum(losses) / len(losses)
-    avg_accuracy = sum(accuracies) / len(accuracies)
-
-    return avg_loss, avg_accuracy, similarities
-
-
-def evaluate_text_embedings(
-        model: nn.Module,
-        dataloader: DataLoader,
-        loader: ImageLoader,
-        # preprocess: nn.Transformer=clip_preprocess, 
-        model_type: ModelType = ModelType.CLIP,
+        image_loader: ImageLoader,
+        device: str
 ) -> torch.Tensor:
     """
-    Evaluate the model on the given dataloader and return the text embeddings for each batch.
-
-    args:
-        model (nn.Module): The model to evaluate
-        dataloader (DataLoader): The dataloader to use for evaluation
-        device (str): The device to use for evaluation
-        preprocess (nn.Transformer): The preprocessing function to use for images
-        model_type (ModelType): The type of model to evaluate
-
-    retunrs:
-        batch_features_all (torch.Tensor): The text embeddings for each batch
+Encode ALL images from dataloader with ALIGN, L2-normalize, and return [N, D] features.
+Assumes batches yield something like: (*_, image_paths, _, _)
     """
-    global align_model, align_auto_tokenizer
+    align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
     model.eval()
-    similarities = []
-    batch_features_all = []
+    feats = []
+    for batch in tqdm(dataloader, desc="Collecting image features"):
+        # Unpack; your loader previously used "... image_names ..." or similar
+        try:
+            *_, img_paths, _, _ = batch
+        except Exception as e:
+            raise RuntimeError(
+                "Expected batch like (*_, image_paths, _, _). "
+                "Adjust unpacking to your Dataset.__getitem__."
+            ) from e
 
-    # Evaluate the model on the given dataloader
-    with torch.no_grad():
-        for batch in tqdm(dataloader, position=0, desc="Batch Progress"):
-            # Unpacking the batch data
-            *_, images, _, words = batch
+        # Load PIL images and batch-process via HF processor
+        pil_images = [image_loader(p) for p in img_paths]
+        proc = align_auto_processor(images=pil_images, return_tensors="pt")
+        proc = {k: v.to(device) for k, v in proc.items()}
 
-            # Process the batch based on the model type
-            if model_type == ModelType.CLIP:
-                batch_features_all.append(clip_text_features_from_description(words, model))
-            elif model_type == ModelType.ALIGN:
+        f = model.get_image_features(**proc)  # [B, D]
+        f = F.normalize(f, dim=-1)  # unit-norm => dot = cosine
+        feats.append(f)
 
-                # Process images and descriptions
-                for image, word in zip(images, words):
-                    image = loader(image)
-                    description = get_phosc_description(word)
-
-                    inputs = align_auto_tokenizer(description, padding=True, return_tensors="pt")
-
-                    text_features = model.get_text_features(**inputs)
-
-                    batch_features_all.append(text_features)
-
-    batch_features_all = torch.cat(batch_features_all, dim=0)
-
-    return batch_features_all
+    feats = torch.cat(feats, dim=0)  # [N, D]
+    return feats
 
 
+@torch.no_grad()
+def collect_image_features_clip(
+        model: nn.Module,
+        dataloader: DataLoader,
+        image_loader: ImageLoader,
+        preprocess,
+        device: str
+) -> torch.Tensor:
+    """
+Encode ALL images from dataloader with CLIP, L2-normalize, and return [N, D] features.
+    """
+    model.eval()
+    feats = []
+    for batch in tqdm(dataloader, desc="Collecting CLIP image features"):
+        try:
+            *_, img_paths, _, _ = batch
+        except Exception as e:
+            raise RuntimeError("Expected batch like (*_, image_paths, _, _).") from e
+
+        pil_images = [image_loader(p) for p in img_paths]
+        images = torch.stack([preprocess(img) for img in pil_images]).to(device)
+
+        f = model.encode_image(images)
+        f = F.normalize(f, dim=-1)
+        feats.append(f)
+
+    feats = torch.cat(feats, dim=0)
+    return feats
+
+
+@torch.no_grad()
+def cosine_similarity_matrix(feats: torch.Tensor) -> torch.Tensor:
+    """
+Compute N×N cosine similarity matrix from L2-normalized features [N, D].
+    """
+    # feats must be unit-normalized along dim=-1
+    return feats @ feats.T  # [N, N], values in [-1, 1]
+
+
+# -----------------------------
+# (Optional) text embeddings
+# -----------------------------
+@torch.no_grad()
+def collect_text_features_align(
+        model: nn.Module,
+        texts: List[str],
+        device: str
+) -> torch.Tensor:
+    """
+Encode a list of texts with ALIGN, L2-normalize, return [N, D].
+    """
+    align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
+    model.eval()
+    out = []
+    # Batch in chunks to avoid OOM if texts is huge
+    B = 512
+    for i in range(0, len(texts), B):
+        chunk = texts[i:i + B]
+        tok = align_auto_tokenizer(chunk, padding=True, truncation=True, return_tensors="pt")
+        tok = {k: v.to(device) for k, v in tok.items()}
+        f = model.get_text_features(**tok)  # [b, D]
+        f = F.normalize(f, dim=-1)
+        out.append(f)
+    return torch.cat(out, dim=0)  # [N, D]
+
+
+@torch.no_grad()
+def collect_text_features_clip(
+        model: nn.Module,
+        texts: List[str],
+        device: str
+) -> torch.Tensor:
+    """
+Encode a list of texts with CLIP, L2-normalize, return [N, D].
+    """
+    model.eval()
+    out = []
+    B = 512
+    for i in range(0, len(texts), B):
+        chunk = texts[i:i + B]
+        text_tokens = clip.tokenize(chunk).to(device)
+        f = model.encode_text(text_tokens)
+        f = F.normalize(f, dim=-1)
+        out.append(f)
+    return torch.cat(out, dim=0)
+
+
+# -----------------------
+# Pretty print results
+# -----------------------
 def print_results(results: List[Result]):
-    for result in results:
-        print(f"Model number {result.model_number}:")
-        print(f"Minimum value in matrix: {result.min_value}")
-        print(f"Maximum value in matrix: {result.max_value}")
-        print(f"Mean value in matrix: {result.average_value}")
+    for r in results:
+        print(f"Model {r.model_number}: min={r.min_value:.6f}  max={r.max_value:.6f}  mean={r.average_value:.6f}")
 
 
-def main(args=None, model=None, index=0) -> Tuple[float, float]:
+# -----------------------
+# Main
+# -----------------------
+def main(args=None, model=None, index=0) -> List[Result]:
     parser = argparse.ArgumentParser()
 
-    parser = matrix_argparse(parser)
-    parser = phosc_net_argparse(parser)
     parser = dataset_argparse(parser)
+    parser = matrix_new_argparse(parser)
+    parser = clip_fine_tune_argparse(parser)
     parser = aling_fine_tune_argparse(parser)
+    parser = phosc_net_argparse(parser)
+    parser = loss_func_argparse(parser)
+    parser = training_common_argparse(parser)
 
-    # Parse arguments
+    # Parse args
     if args is None:
         args = parser.parse_args()
     else:
         args = parser.parse_args(args)
 
-    root_dir = ospj(DATA_FOLDER, "BengaliWords_CroppedVersion_Folds")
+    print(args.save_name)
 
-    phosc_model = get_phoscnet(args, device)
+    # Decide which model type we are using
+    if args.save_name == 'clip-fine-tune':
+        print("clip")
+        model_type = 'CLIP'
+    elif args.save_name == 'align-fine-tune':
+        print("align")
+        model_type = 'ALIGN'
+    else:
+        # Fallback or error; based on issue description, these are the two expected values.
+        # We can default to ALIGN if it's not clip_fine_tune.
+        model_type = 'ALIGN'
+
+    # Dataset / loader
+    # NOTE: Adapt this root_dir to your actual project layout
+    root_dir = ospj(DATA_FOLDER, "BengaliWords_CroppedVersion_Folds")
+    phosc_model = None
     test_loader, _ = get_test_loader(args, phosc_model)
     image_loader = ImageLoader(ospj(root_dir, args.split_name))
 
     results = []
 
     for num in args.nums:
-        model_save_path = ospj(args.save_dir, args.name, args.split_name, str(num))
+        model_dir = ospj(args.save_dir, args.save_name, args.split_name, str(num))
 
-        align_fine_tuned_model = AlignModel.from_pretrained("kakaobrain/align-base")
-        align_fine_tuned_model_path = ospj(model_save_path, args.checkpoint_name)
-        align_fine_tuned_model.load_state_dict(torch.load(align_fine_tuned_model_path))
+        if model_type == 'ALIGN':
+            # Load the fine-tuned ALIGN model
+            fine_tuned_model = AlignModel.from_pretrained("kakaobrain/align-base").to(device).eval()
 
-        if args.evaluate == 'model':
-            pass
-        elif args.evaluate == 'text':
-            batch_features_all = evaluate_text_embedings(align_fine_tuned_model, test_loader, image_loader,
-                                                         ModelType.ALIGN)
+            if args.model_source == 'fine-tuned':
+                ckpt_path = ospj(model_dir, args.checkpoint_name)
+                print(f"Loading ALIGN model from {ckpt_path}")
+                state = torch.load(ckpt_path, map_location=device)
+                fine_tuned_model.load_state_dict(state, strict=True)
 
-        matrix = calculate_cos_angle_matrix(batch_features_all)
-        min_value = torch.min(matrix).item()
-        max_value = torch.max(matrix).item()
-        average_value = torch.mean(matrix).item()
+            preprocess = None # ALIGN uses its own processor inside collection funcs
 
-        res = Result(
-            model_number=num,
-            min_value=min_value,
-            max_value=max_value,
-            average_value=average_value
-        )
+        else:
+            # Load the fine-tuned CLIP model
+            fine_tuned_model, preprocess = clip.load("ViT-B/32", device=device)
+            fine_tuned_model = fine_tuned_model.float().eval()
 
-        save_matrix(matrix, res, ospj(model_save_path, num), f'matrix_{num}')
+            if args.model_source == 'fine-tuned':
+                ckpt_path = ospj(model_dir, args.checkpoint_name)
+                print(f"Loading CLIP model from {ckpt_path}")
+                state = torch.load(ckpt_path, map_location=device)
+
+                # CLIP checkpoints often contain the state_dict directly or under a key
+                if isinstance(state, dict) and 'model_state_dict' in state:
+                    state = state['model_state_dict']
+
+                fine_tuned_model.load_state_dict(state, strict=True)
+
+        if args.evaluate == 'text':
+            # If you really want text–text: collect all words from the loader
+            all_words = []
+            for batch in tqdm(test_loader, desc="Collecting words"):
+                try:
+                    *_, _, _, words = batch
+                except Exception as e:
+                    raise RuntimeError("Expected words in batch at position -1.") from e
+                all_words.extend(list(words))
+
+            if model_type == 'ALIGN':
+                print(f"Collecting text features for ALIGN model")
+                feats = collect_text_features_align(fine_tuned_model, all_words, device)
+            else:
+                print(f"Collecting text features for CLIP model")
+                feats = collect_text_features_clip(fine_tuned_model, all_words, device)
+        else:
+            # Default: image–image matrix
+            if model_type == 'ALIGN':
+                print(f"Collecting image features for ALIGN model")
+                feats = collect_image_features_align(fine_tuned_model, test_loader, image_loader, device)
+            else:
+                print(f"Collecting image features for CLIP model")
+                feats = collect_image_features_clip(fine_tuned_model, test_loader, image_loader, preprocess, device)
+
+        # Cosine similarity matrix (vectorized)
+        S = cosine_similarity_matrix(feats)  # [N, N], cosine in [-1, 1]
+        # If you prefer cosine *distance*: D = 1 - S  (bounded in [0, 2] for normalized vecs)
+
+        # Stats
+        min_value = torch.min(S).item()
+        max_value = torch.max(S).item()
+        mean_value = torch.mean(S).item()
+
+        res = Result(model_number=num, min_value=min_value, max_value=max_value, average_value=mean_value)
+
+        # Save next to model dir; use a stable file stem
+        save_matrix(S, res, ospj(model_dir, "dummy_marker_path"), csv_filename=f'matrix_{num}')
+
+        if args.heatmap:
+            heatmap_path = ospj(model_dir, f"matrix_{num}_heatmap.png")
+            save_heatmap(
+                S,
+                heatmap_path,
+                title=f"{model_type} cosine similarity (model {num})",
+                vmin=-1.0, vmax=1.0,
+                cmap=args.cmap,
+                dpi=300,
+                cell_px=args.cell_px,
+                max_width_px=args.max_width_px,
+                tick_step=None,
+                add_colorbar=True,
+                downsample_block=args.downsample_block,
+            )
 
         results.append(res)
 
@@ -455,14 +493,6 @@ def main(args=None, model=None, index=0) -> Tuple[float, float]:
 
 
 if __name__ == '__main__':
-    results = main(model=align_model)
-
+    # Defaulting to no specific model here as main handles loading now
+    results = main()
     print_results(results)
-
-    # similarities, batch_features_all = evaluate_model(fine_tuned_clip_model, test_loader, device, fine_tuned_clip_preprocess)
-    # similarities, batch_features_all = evaluate_model(original_clip_model, test_loader, device, original_clip_preprocess)
-    # batch_features_all = evaluate_text_embedings(original_clip_model, test_loader, ModelType.CLIP)
-    # batch_features_all = evaluate_text_embedings(model, test_loader, ModelType.CLIP)
-    # batch_features_all = evaluate_text_embedings(align_model, test_loader, align_processor, ModelType.ALIGN)
-
-    # batch_features_all = evaluate_text_embedings(model, test_loader, ModelType.CLIP)

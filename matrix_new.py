@@ -1,491 +1,373 @@
-from __future__ import annotations
-
-from utils.get_dataset import get_phoscnet, get_test_loader
-from data.dataset_bengali import ImageLoader
-
 import os
-from os import PathLike
 from os.path import join as ospj
-from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
 from enum import Enum
-from typing import List, Tuple
-
 import argparse
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from PIL import Image
 
+import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from timm import create_model
+from tqdm import tqdm
 
-import matplotlib
-
-matplotlib.use("Agg")  # headless-safe
-import matplotlib.pyplot as plt
-import numpy as np
-
-# (You keep these if other parts of your project import them)
-from flags import DATA_FOLDER, device
-from data.dataset_bengali import ImageLoader
-from utils.dbe import dbe
-
-# Optional/legacy imports kept for compatibility
 import clip
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-from torchvision import transforms
+from transformers import AlignModel, AlignProcessor, AutoTokenizer, AutoProcessor
 
-from transformers import (
-    AlignProcessor,
-    AlignModel,
-    AutoTokenizer,
-    AutoProcessor,
-)
-
+from flags import DATA_FOLDER, device
+from parser import phosc_net_argparse, dataset_argparse, aling_fine_tune_argparse, matrix_argparse
 from utils.get_dataset import get_test_loader, get_phoscnet
-from parser import (
-    dataset_argparse,
-    phosc_net_argparse,
-    aling_fine_tune_argparse,
-    matrix_new_argparse,
-    clip_fine_tune_argparse,
-    loss_func_argparse,
-    training_common_argparse,
-)
+from data.dataset_bengali import ImageLoader
+from modules.utils.utils import get_phosc_description
+from utils.utils import clip_text_features_from_description
+
+
+class ModelType(Enum):
+    CLIP = "CLIP"
+    ALIGN = "ALIGN"
+
+
+class EvalTask(Enum):
+    TEXT_MATRIX = "text_matrix"   # debug: text-text similarity matrix
+    QBS = "qbs"                   # text/prompt -> image retrieval
+    QBE = "qbe"                   # image -> image retrieval
+
+
+def l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    return F.normalize(x, p=2, dim=-1)
+
+
+def parse_ks(ks: str) -> List[int]:
+    return [int(k.strip()) for k in ks.split(",") if k.strip()]
+
+
+def average_precision(relevant: np.ndarray) -> float:
+    """
+    relevant: boolean array of length N, True where a relevant item occurs in the ranked list
+    """
+    if relevant.sum() == 0:
+        return np.nan  # caller decides whether to skip or treat as 0
+    idx = np.where(relevant)[0]
+    precisions = [(relevant[:i + 1].sum() / (i + 1)) for i in idx]
+    return float(np.mean(precisions))
+
+
+def compute_map_and_recall(
+    sim: np.ndarray,
+    query_labels: List[str],
+    cand_labels: List[str],
+    ks: List[int],
+    exclude_self: bool = False,
+    query_ids: Optional[List[str]] = None,
+    cand_ids: Optional[List[str]] = None,
+    filter_singletons: bool = False,
+) -> Dict[str, float]:
+    """
+    sim: [Q, N] similarity matrix
+    query_labels: labels for queries
+    cand_labels: labels for candidates
+    exclude_self: for QbE (query in candidate pool), remove same id from ranking
+    filter_singletons: skip queries where number of relevant candidates is 0 (after self removal if enabled)
+    """
+    Q, N = sim.shape
+    cand_labels_arr = np.array(cand_labels)
+
+    ap_list = []
+    recall_at_k = {k: [] for k in ks}
+
+    for qi in range(Q):
+        scores = sim[qi]
+        order = np.argsort(-scores)  # descending
+        if exclude_self and query_ids is not None and cand_ids is not None:
+            # remove the candidate with same id as query
+            mask = np.array([cand_ids[j] != query_ids[qi] for j in order], dtype=bool)
+            order = order[mask]
+
+        # relevant set (by word identity)
+        rel = (cand_labels_arr[order] == query_labels[qi])
+
+        # singleton handling for QbE
+        if filter_singletons and rel.sum() == 0:
+            continue
+
+        ap = average_precision(rel)
+        if not np.isnan(ap):
+            ap_list.append(ap)
+
+        # Recall@k
+        total_rel = rel.sum()
+        for k in ks:
+            k_eff = min(k, len(rel))
+            if total_rel == 0:
+                rk = np.nan
+            else:
+                rk = float(rel[:k_eff].sum() / total_rel)
+            recall_at_k[k].append(rk)
+
+    # aggregate
+    metrics = {}
+    metrics["mAP"] = float(np.nanmean(ap_list)) if len(ap_list) > 0 else float("nan")
+    for k in ks:
+        metrics[f"Recall@{k}"] = float(np.nanmean(recall_at_k[k])) if len(recall_at_k[k]) > 0 else float("nan")
+
+    metrics["num_queries_used"] = int(len(ap_list))
+    return metrics
 
 
 # -----------------------
-# Globals / Preprocessing
+# Embedding extraction
 # -----------------------
-split = 'fold_0_t'
-use_augmented = False
-
-# ALIGN (HF): processor can batch images (and texts). We'll use AutoProcessor for images below.
-# align_processor = AlignProcessor.from_pretrained("kakaobrain/align-base")
-# align_model = AlignModel.from_pretrained("kakaobrain/align-base")
-# align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
-# align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
-
-# (Kept for completeness; not used in this matrix script)
-clip_preprocess_default = Compose([
-    Resize(224, interpolation=Image.BICUBIC),
-    CenterCrop(224),
-    ToTensor(),
-    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-])
-
-
-def _downsample_matrix_avgpool(M: torch.Tensor, block: int = 1) -> torch.Tensor:
-    """
-Downsample a square matrix by average pooling (block x block).
-Drops leftover rows/cols if N is not divisible by block.
-    """
-    if block <= 1:
-        return M
-    if torch.is_tensor(M):
-        X = M
-    else:
-        X = torch.tensor(M, dtype=torch.float32)
-
-    # keep square assumption; trim edges if needed
-    N = X.shape[0]
-    trim = N - (N // block) * block
-    if trim > 0:
-        X = X[:-trim, :-trim]
-
-    X = X.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-    X = F.avg_pool2d(X, kernel_size=block, stride=block, ceil_mode=False)
-    return X.squeeze(0).squeeze(0)  # [H', W']
-
-
-# -----------------------------
-# Heatmap saver (vectorized)
-# -----------------------------
-def save_heatmap(
-        S: torch.Tensor,
-        out_path: str,
-        title: str | None = None,
-        vmin: float = -1.0,
-        vmax: float = 1.0,
-        cmap: str = "coolwarm",
-        dpi: int = 300,
-        cell_px: int = 3,
-        max_width_px: int | None = 1800,
-        tick_step: int | None = None,
-        add_colorbar: bool = True,
-        downsample_block: int = 1,
-):
-    """
-Save a cosine-similarity heatmap for S (N x N), with crisp cells and small squares for N~300-400.
-
-- cell_px sets size of each cell in pixels before capping by max_width_px.
-- If max_width_px is set, cell size is reduced to keep figure at/below that width.
-- vmin/vmax fix the color scale (important when comparing different runs).
-- downsample_block>1 will average-pool the matrix (e.g., 2, 4, 8) for a smaller overview.
-
-    """
-    # Downsample if requested
-    if downsample_block and downsample_block > 1:
-        S = _downsample_matrix_avgpool(S, downsample_block)
-
-    # Move to CPU numpy
-    if torch.is_tensor(S):
-        S_np = S.detach().cpu().numpy()
-    else:
-        S_np = np.asarray(S)
-    N = S_np.shape[0]
-
-    # Determine figure size from desired pixels per cell
-    width_px = N * cell_px
-    if max_width_px is not None and width_px > max_width_px:
-        cell_px = max(1, max_width_px // max(1, N))
-        width_px = N * cell_px
-
-    fig_w_in = max(3.0, width_px / dpi)  # keep at least 3 inches for readability
-    fig_h_in = fig_w_in
-
-    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), constrained_layout=True)
-    # imshow is the recommended fast path for raster heatmaps on regular grids
-    im = ax.imshow(
-        S_np,
-        vmin=vmin, vmax=vmax,  # fixed normalization for cosine [-1,1]
-        cmap=cmap,
-        interpolation="nearest",  # no smoothing; crisp cells
-        aspect="equal",
-    )
-
-    if add_colorbar:
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.ax.set_ylabel("cosine similarity", rotation=270, labelpad=12)
-
-    ax.set_title(title or f"Cosine similarity (N={N})", fontsize=10)
-    ax.set_xlabel("image index")
-    ax.set_ylabel("image index")
-
-    # Ticks: off by default for large N; enable sparse ticks with tick_step
-    if tick_step and tick_step > 0:
-        idx = np.arange(0, N, tick_step)
-        ax.set_xticks(idx)
-        ax.set_yticks(idx)
-        ax.tick_params(axis="both", which="both", labelsize=6, length=0)
-    else:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Heatmap saved at: {out_path}")
-
-
-# -----------------------
-# Data classes / results
-# -----------------------
-@dataclass
-class Result:
-    model_number: int
-    min_value: float
-    max_value: float
-    average_value: float
-
-
-# -----------------------
-# I/O: save the matrix
-# -----------------------
-def save_matrix(matrix: torch.Tensor, results: Result, _model_save_path: PathLike, csv_filename="matrix"):
-    """
-Save the given matrix as CSV and a small text summary next to it.
-    """
-    directory = os.path.dirname(_model_save_path)
-    if not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-
-    csv_path = ospj(directory, f'{csv_filename}.csv')
-    txt_path = ospj(directory, f'{csv_filename}.txt')
-
-    if torch.is_tensor(matrix):
-        matrix = matrix.detach().cpu().numpy()
-
-    df = pd.DataFrame(matrix)
-    df.to_csv(csv_path, index=False, header=False)
-
-    with open(txt_path, 'w') as f:
-        f.write(f"Model number: {results.model_number}\n")
-        f.write(f"Minimum value in matrix: {results.min_value}\n")
-        f.write(f"Maximum value in matrix: {results.max_value}\n")
-        f.write(f"Mean value in matrix: {results.average_value}\n")
-
-    print(f"Matrix saved at: {csv_path}")
-
-
-# ----------------------------------------
-# Cosine matrix helpers (vectorized & fast)
-# ----------------------------------------
 @torch.no_grad()
-def collect_image_features_align(
-        model: nn.Module,
-        dataloader: DataLoader,
-        image_loader: ImageLoader,
-        device: str
-) -> torch.Tensor:
+def extract_image_embeddings(
+    model_type: ModelType,
+    model,
+    dataloader,
+    image_loader: ImageLoader,
+    clip_preprocess=None,
+    align_processor=None,
+) -> Tuple[torch.Tensor, List[str], List[str]]:
     """
-Encode ALL images from dataloader with ALIGN, L2-normalize, and return [N, D] features.
-Assumes batches yield something like: (*_, image_paths, _, _)
-    """
-    align_auto_processor = AutoProcessor.from_pretrained("kakaobrain/align-base")
-    model.eval()
-    feats = []
-    for batch in tqdm(dataloader, desc="Collecting image features"):
-        # Unpack; your loader previously used "... image_names ..." or similar
-        try:
-            *_, img_paths, _, _ = batch
-        except Exception as e:
-            raise RuntimeError(
-                "Expected batch like (*_, image_paths, _, _). "
-                "Adjust unpacking to your Dataset.__getitem__."
-            ) from e
-
-        # Load PIL images and batch-process via HF processor
-        pil_images = [image_loader(p) for p in img_paths]
-        proc = align_auto_processor(images=pil_images, return_tensors="pt")
-        proc = {k: v.to(device) for k, v in proc.items()}
-
-        f = model.get_image_features(**proc)  # [B, D]
-        f = F.normalize(f, dim=-1)  # unit-norm => dot = cosine
-        feats.append(f)
-
-    feats = torch.cat(feats, dim=0)  # [N, D]
-    return feats
-
-
-@torch.no_grad()
-def collect_image_features_clip(
-        model: nn.Module,
-        dataloader: DataLoader,
-        image_loader: ImageLoader,
-        preprocess,
-        device: str
-) -> torch.Tensor:
-    """
-Encode ALL images from dataloader with CLIP, L2-normalize, and return [N, D] features.
+    Returns:
+      feats: [N, D]
+      labels: list of word labels (same length N)
+      ids: list of image_names (same length N)
     """
     model.eval()
     feats = []
-    for batch in tqdm(dataloader, desc="Collecting CLIP image features"):
-        try:
-            *_, img_paths, _, _ = batch
-        except Exception as e:
-            raise RuntimeError("Expected batch like (*_, image_paths, _, _).") from e
+    labels = []
+    ids = []
 
-        pil_images = [image_loader(p) for p in img_paths]
-        images = torch.stack([preprocess(img) for img in pil_images]).to(device)
+    for batch in tqdm(dataloader, desc="Extracting image embeddings"):
+        *_, image_names, _, words = batch  # <-- your batch format
 
-        f = model.encode_image(images)
-        f = F.normalize(f, dim=-1)
-        feats.append(f)
+        if model_type == ModelType.CLIP:
+            images = [clip_preprocess(image_loader(n)) for n in image_names]
+            images = torch.stack(images, dim=0).to(device)
+            img_feat = model.encode_image(images)
+            img_feat = l2_normalize(img_feat)
+
+        elif model_type == ModelType.ALIGN:
+            # process as a batch (processor supports list of PIL images)
+            pil_images = [image_loader(n) for n in image_names]
+            inputs = align_processor(images=pil_images, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            img_feat = model.get_image_features(**inputs)
+            img_feat = l2_normalize(img_feat)
+
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        feats.append(img_feat.cpu())
+        labels.extend(list(words))
+        ids.extend(list(image_names))
 
     feats = torch.cat(feats, dim=0)
-    return feats
+    return feats, labels, ids
 
 
 @torch.no_grad()
-def cosine_similarity_matrix(feats: torch.Tensor) -> torch.Tensor:
+def extract_text_embeddings(
+    model_type: ModelType,
+    model,
+    dataloader,
+    clip_model=None,
+    align_tokenizer=None,
+) -> Tuple[torch.Tensor, List[str]]:
     """
-Compute N×N cosine similarity matrix from L2-normalized features [N, D].
-    """
-    # feats must be unit-normalized along dim=-1
-    return feats @ feats.T  # [N, N], values in [-1, 1]
-
-
-# -----------------------------
-# (Optional) text embeddings
-# -----------------------------
-@torch.no_grad()
-def collect_text_features_align(
-        model: nn.Module,
-        texts: List[str],
-        device: str
-) -> torch.Tensor:
-    """
-Encode a list of texts with ALIGN, L2-normalize, return [N, D].
-    """
-    align_auto_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
-    model.eval()
-    out = []
-    # Batch in chunks to avoid OOM if texts is huge
-    B = 512
-    for i in range(0, len(texts), B):
-        chunk = texts[i:i + B]
-        tok = align_auto_tokenizer(chunk, padding=True, truncation=True, return_tensors="pt")
-        tok = {k: v.to(device) for k, v in tok.items()}
-        f = model.get_text_features(**tok)  # [b, D]
-        f = F.normalize(f, dim=-1)
-        out.append(f)
-    return torch.cat(out, dim=0)  # [N, D]
-
-
-@torch.no_grad()
-def collect_text_features_clip(
-        model: nn.Module,
-        texts: List[str],
-        device: str
-) -> torch.Tensor:
-    """
-Encode a list of texts with CLIP, L2-normalize, return [N, D].
+    QbS queries: create a prompt from word and embed with the text tower.
+    Returns:
+      feats: [Q, D]
+      labels: list of word labels for queries
     """
     model.eval()
-    out = []
-    B = 512
-    for i in range(0, len(texts), B):
-        chunk = texts[i:i + B]
-        text_tokens = clip.tokenize(chunk).to(device)
-        f = model.encode_text(text_tokens)
-        f = F.normalize(f, dim=-1)
-        out.append(f)
-    return torch.cat(out, dim=0)
+    feats = []
+    labels = []
+
+    for batch in tqdm(dataloader, desc="Extracting text embeddings (QbS queries)"):
+        *_, image_names, _, words = batch  # <-- your batch format
+        # We treat each instance as a query by default (simple & consistent with your dataloader).
+        # If you later want unique-word queries, we can add --unique_queries.
+        if model_type == ModelType.CLIP:
+            prompts = [get_phosc_description(w) for w in words]
+            # your util likely supports list input; if it doesn't, we can loop.
+            txt_feat = clip_text_features_from_description(prompts, clip_model)
+            txt_feat = txt_feat.squeeze(1) if txt_feat.dim() == 3 else txt_feat
+            txt_feat = l2_normalize(txt_feat)
+
+        elif model_type == ModelType.ALIGN:
+            prompts = [get_phosc_description(w) for w in words]
+            inputs = align_tokenizer(prompts, padding=True, return_tensors="pt", truncation=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            txt_feat = model.get_text_features(**inputs)
+            txt_feat = l2_normalize(txt_feat)
+
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        feats.append(txt_feat.cpu())
+        labels.extend(list(words))
+
+    feats = torch.cat(feats, dim=0)
+    return feats, labels
 
 
-# -----------------------
-# Pretty print results
-# -----------------------
-def print_results(results: List[Result]):
-    for r in results:
-        print(f"Model {r.model_number}: min={r.min_value:.6f}  max={r.max_value:.6f}  mean={r.average_value:.6f}")
-
-
-# -----------------------
-# Main
-# -----------------------
-def main(args=None, model=None, index=0) -> List[Result]:
+def build_parser():
     parser = argparse.ArgumentParser()
-
-    parser = dataset_argparse(parser)
-    parser = matrix_new_argparse(parser)
-    parser = clip_fine_tune_argparse(parser)
-    parser = aling_fine_tune_argparse(parser)
+    parser = matrix_argparse(parser)
     parser = phosc_net_argparse(parser)
-    parser = loss_func_argparse(parser)
-    parser = training_common_argparse(parser)
+    parser = dataset_argparse(parser)
+    parser = aling_fine_tune_argparse(parser)
 
-    # Parse args
-    if args is None:
-        args = parser.parse_args()
-    else:
-        args = parser.parse_args(args)
+    parser.add_argument("--task", type=str, default="qbs",
+                        choices=[t.value for t in EvalTask],
+                        help="Which evaluation to run: qbs, qbe, or text_matrix.")
+    parser.add_argument("--model_type", type=str, default="ALIGN",
+                        choices=[m.value for m in ModelType],
+                        help="Which backbone to evaluate.")
+    parser.add_argument("--clip_backbone", type=str, default="ViT-B/32",
+                        help="CLIP backbone name if --model_type CLIP.")
+    parser.add_argument("--ks", type=str, default="1,5,10",
+                        help="Comma-separated k values for Recall@k.")
+    parser.add_argument("--exclude_self", action="store_true",
+                        help="Exclude self-match for QbE when query images are in candidate pool.")
+    parser.add_argument("--filter_singletons", action="store_true",
+                        help="Skip queries with no relevant items (recommended for QbE).")
+    parser.add_argument("--save_similarity", action="store_true",
+                        help="Save similarity matrix as .npy (can be large).")
+    parser.add_argument("--save_scores", action="store_true",
+                        help="Save metrics to a text file next to the checkpoint.")
+    return parser
 
-    print(args.save_name)
 
-    # Decide which model type we are using
-    if args.save_name == 'clip-fine-tune':
-        print("clip")
-        model_type = 'CLIP'
-    elif args.save_name == 'align-fine-tune':
-        print("align")
-        model_type = 'ALIGN'
-    else:
-        # Fallback or error; based on issue description, these are the two expected values.
-        # We can default to ALIGN if it's not clip_fine_tune.
-        model_type = 'ALIGN'
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
 
-    # Dataset / loader
-    # NOTE: Adapt this root_dir to your actual project layout
+    task = EvalTask(args.task)
+    model_type = ModelType(args.model_type)
+    ks = parse_ks(args.ks)
+
     root_dir = ospj(DATA_FOLDER, "BengaliWords_CroppedVersion_Folds")
-    phosc_model = None
+    phosc_model = get_phoscnet(args, device)
     test_loader, _ = get_test_loader(args, phosc_model)
     image_loader = ImageLoader(ospj(root_dir, args.split_name))
+
+    clip_model = None
+    clip_preprocess = None
+
+    align_processor = None
+    align_tokenizer = None
+
+    if model_type == ModelType.CLIP:
+        clip_model, clip_preprocess = clip.load(args.clip_backbone, device=device)
+        model = clip_model
+    else:
+        align_processor = AlignProcessor.from_pretrained("kakaobrain/align-base")
+        align_tokenizer = AutoTokenizer.from_pretrained("kakaobrain/align-base")
+        model = AlignModel.from_pretrained("kakaobrain/align-base").to(device)
 
     results = []
 
     for num in args.nums:
-        model_dir = ospj(args.save_dir, args.save_name, args.split_name, str(num))
-        ckpt_path = ospj(model_dir, args.checkpoint_name)
+        model_save_path = ospj(args.save_dir, args.name, args.split_name, str(num))
+        ckpt_path = ospj(model_save_path, args.checkpoint_name)
 
-        if model_type == 'ALIGN':
-            print(f"Loading ALIGN model from {ckpt_path}")
-            # Load the fine-tuned ALIGN model
-            fine_tuned_model = AlignModel.from_pretrained("kakaobrain/align-base").to(device).eval()
-            if args.model_source == 'fine-tuned':
-                state = torch.load(ckpt_path, map_location=device)
-                fine_tuned_model.load_state_dict(state, strict=True)
-            preprocess = None # ALIGN uses its own processor inside collection funcs
+        if model_type == ModelType.CLIP:
+            state = torch.load(ckpt_path, map_location="cpu")
+            missing, unexpected = model.load_state_dict(state, strict=False)
         else:
-            print(f"Loading CLIP model from {ckpt_path}")
-            # Load the fine-tuned CLIP model
-            fine_tuned_model, preprocess = clip.load("ViT-B/32", device=device)
-            fine_tuned_model = fine_tuned_model.float().eval()
-            if args.model_source == 'fine-tuned':
-                state = torch.load(ckpt_path, map_location=device)
-                # CLIP checkpoints often contain the state_dict directly or under a key
-                if isinstance(state, dict) and 'model_state_dict' in state:
-                    state = state['model_state_dict']
-                fine_tuned_model.load_state_dict(state, strict=True)
+            state = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(state)
 
-        if args.evaluate == 'text':
-            # If you really want text–text: collect all words from the loader
-            all_words = []
-            for batch in tqdm(test_loader, desc="Collecting words"):
-                try:
-                    *_, _, _, words = batch
-                except Exception as e:
-                    raise RuntimeError("Expected words in batch at position -1.") from e
-                all_words.extend(list(words))
+        model = model.to(device)
+        model.eval()
 
-            if model_type == 'ALIGN':
-                print(f"Collecting text features for ALIGN model")
-                feats = collect_text_features_align(fine_tuned_model, all_words, device)
-            else:
-                print(f"Collecting text features for CLIP model")
-                feats = collect_text_features_clip(fine_tuned_model, all_words, device)
-        else:
-            # Default: image–image matrix
-            if model_type == 'ALIGN':
-                print(f"Collecting image features for ALIGN model")
-                feats = collect_image_features_align(fine_tuned_model, test_loader, image_loader, device)
-            else:
-                print(f"Collecting image features for CLIP model")
-                feats = collect_image_features_clip(fine_tuned_model, test_loader, image_loader, preprocess, device)
+        if task == EvalTask.TEXT_MATRIX:
+            text_feats, text_labels = extract_text_embeddings(
+                model_type=model_type,
+                model=model,
+                dataloader=test_loader,
+                clip_model=model if model_type == ModelType.CLIP else None,
+                align_tokenizer=align_tokenizer,
+            )
+            text_feats = l2_normalize(text_feats)
+            sim = (text_feats @ text_feats.T).cpu().numpy()
 
-        # Cosine similarity matrix (vectorized)
-        S = cosine_similarity_matrix(feats)  # [N, N], cosine in [-1, 1]
-        # If you prefer cosine *distance*: D = 1 - S  (bounded in [0, 2] for normalized vecs)
+            res = {
+                "checkpoint": num,
+                "min": float(sim.min()),
+                "max": float(sim.max()),
+                "mean": float(sim.mean()),
+            }
+            print(res)
 
-        # Stats
-        min_value = torch.min(S).item()
-        max_value = torch.max(S).item()
-        mean_value = torch.mean(S).item()
+            if args.save_similarity:
+                np.save(ospj(model_save_path, f"text_matrix_{num}.npy"), sim)
 
-        res = Result(model_number=num, min_value=min_value, max_value=max_value, average_value=mean_value)
+            results.append(res)
+            continue
 
-        # Save next to model dir; use a stable file stem
-        save_matrix(S, res, ospj(model_dir, "dummy_marker_path"), csv_filename=f'matrix_{num}')
+        img_feats, img_labels, img_ids = extract_image_embeddings(
+            model_type=model_type,
+            model=model,
+            dataloader=test_loader,
+            image_loader=image_loader,
+            clip_preprocess=clip_preprocess,
+            align_processor=align_processor,
+        )
 
-        if args.heatmap:
-            heatmap_path = ospj(model_dir, f"matrix_{num}_heatmap.png")
-            save_heatmap(
-                S,
-                heatmap_path,
-                title=f"{model_type} cosine similarity (model {num})",
-                vmin=-1.0, vmax=1.0,
-                cmap=args.cmap,
-                dpi=300,
-                cell_px=args.cell_px,
-                max_width_px=args.max_width_px,
-                tick_step=None,
-                add_colorbar=True,
-                downsample_block=args.downsample_block,
+        if task == EvalTask.QBS:
+            txt_feats, txt_labels = extract_text_embeddings(
+                model_type=model_type,
+                model=model,
+                dataloader=test_loader,
+                clip_model=model if model_type == ModelType.CLIP else None,
+                align_tokenizer=align_tokenizer,
+            )
+            txt_feats = l2_normalize(txt_feats)
+            img_feats = l2_normalize(img_feats)
+
+            sim = (txt_feats @ img_feats.T).cpu().numpy()  # [Q, N]
+            metrics = compute_map_and_recall(
+                sim=sim,
+                query_labels=txt_labels,
+                cand_labels=img_labels,
+                ks=ks,
+                exclude_self=False,
+                filter_singletons=False,
             )
 
-        results.append(res)
+        elif task == EvalTask.QBE:
+            img_feats = l2_normalize(img_feats)
+            sim = (img_feats @ img_feats.T).cpu().numpy()  # [N, N]
+            metrics = compute_map_and_recall(
+                sim=sim,
+                query_labels=img_labels,
+                cand_labels=img_labels,
+                ks=ks,
+                exclude_self=args.exclude_self,
+                query_ids=img_ids,
+                cand_ids=img_ids,
+                filter_singletons=args.filter_singletons,
+            )
+
+        else:
+            raise ValueError(f"Unknown task: {task}")
+
+        metrics["checkpoint"] = int(num)
+        print(metrics)
+
+        if args.save_similarity:
+            np.save(ospj(model_save_path, f"sim_{task.value}_{num}.npy"), sim)
+
+        if args.save_scores:
+            out_path = ospj(model_save_path, f"metrics_{task.value}_{num}.txt")
+            with open(out_path, "w") as f:
+                for k, v in metrics.items():
+                    f.write(f"{k}: {v}\n")
+
+        results.append(metrics)
 
     return results
 
 
-if __name__ == '__main__':
-    # Defaulting to no specific model here as main handles loading now
-    results = main()
-    print_results(results)
+if __name__ == "__main__":
+    main()
