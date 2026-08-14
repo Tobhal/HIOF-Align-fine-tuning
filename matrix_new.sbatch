@@ -14,10 +14,8 @@
 # Execute the script
 python matrix_new.py \
   --split_name fold_3_aug_square \
-  --nums 8 9 10 \
+  --nums 0 \
   --heatmap \
-  --save_name "align-fine-tune" \
-  --task qbs \
-  --model ALIGN \
-  --save_scores
+  --save_name "clip-fine-tune" \
+  --model_source "pretrained"
 

@@ -8,8 +8,7 @@
 #SBATCH --time=1:00:00                 # Time limit hrs:min:sec
 
 python plot_loss.py \
-  --nums 5 6 7 \
+  --nums 7 8 \
   --save_plot \
   --split_name fold_3_aug_square \
   --save_name "clip-fine-tune"
-  #--save_name "align-fine-tune"

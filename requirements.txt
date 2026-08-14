@@ -1,0 +1,5 @@
+numpy
+opencv-python
+pillow
+timm
+num2words

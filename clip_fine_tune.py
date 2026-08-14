@@ -557,7 +557,7 @@ def validate_epoch(
 
             # Loss
             if loss_func == 'triplet':
-                loss = compute_triplet_margin_loss(logits_per_image, class_labels, margin)
+                loss = triplet_margin_from_similarity(logits_per_image, class_labels, margin)
             elif loss_func == 'contrastive':
                 loss = compute_contrastive_loss(logits_per_image, class_labels, margin)
             elif loss_func == 'simple':
@@ -616,7 +616,6 @@ def main(_args=None):
 
     image_loader = ImageLoader(ospj(DATA_FOLDER, args.data_dir, args.split_name))
 
-    optimizer = None
     lr_scheduler = None
 
     save_path = ospj(args.save_dir, args.name, args.split_name)

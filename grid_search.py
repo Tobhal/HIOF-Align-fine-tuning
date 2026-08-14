@@ -1,4 +1,4 @@
-from align_fine_tuning import main as fine_tune_main
+from align_fine_tune import main as fine_tune_main
 from matix import main as matix_main
 from itertools import product
 

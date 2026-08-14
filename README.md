@@ -14,37 +14,41 @@ get it to do word spotting but with better preformence and even better generliza
 
 Align
 
-| LR    | Eps  | Batch size | Accum | Head size | Optimizer | Lr scheduler | lr_exploration_factor | Loss function | Description | Folder number | Status |
-|-------|------|------------|-------|-----------|-----------|--------------|-----------------------|---------------|-------------|---------------|--------|
-| 1e-6  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 1             | D      |
-| 1e-5  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 2             | D      |
-| 1e-4  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 3             | D      |
-| 1e-6  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 4             | D      |
-| 1e-5  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 5             | D      |
-| 1e-4  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 6             | D      |
-| 1e-6  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 7             | D      |
-| 1e-6  | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Short desc  | 8             | F      |
-| 1e-6  | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Long desc   | 9             | F      |
-| 1e-6  | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Long desc   | 10            | F      |
-| 1e-10 | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Long desc   | 11            | F      |
-| 1e-5  | 1e-8 | 32         | 8     | 1024      | Adam      | lr_scheduler | 1.5                   | contrastive   | Long desc   | 12            | D      |
-| 1e-5  | 1e-8 | 32         | 8     | 1024      | Adam      | lr_scheduler | 2.0                   | contrastive   | Long desc   | 13            | D      |
-| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 31            | R      |
+| LR    | Eps  | Batch size | Accum | Head size | Optimizer | Lr scheduler | lr_exploration_factor | Loss function | Description | Folder number | Status | Comment            |
+|-------|------|------------|-------|-----------|-----------|--------------|-----------------------|---------------|-------------|---------------|--------|--------------------|
+| 1e-6  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 1             | D      |                    |
+| 1e-5  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 2             | D      |                    |
+| 1e-4  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 3             | D      |                    |
+| 1e-6  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 4             | D      |                    |
+| 1e-5  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 5             | D      |                    |
+| 1e-4  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 6             | D      |                    |
+| 1e-6  | 1e-8 | 32         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Indices     | 7             | D      |                    |
+| 1e-6  | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Short desc  | 8             | D      |                    |
+| 1e-6  | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Long desc   | 9             | D      |                    |
+| 1e-6  | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Long desc   | 10            | D      |                    |
+| 1e-10 | 1e-8 | 32         | 8     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Long desc   | 11            | D      |                    |
+| 1e-5  | 1e-8 | 32         | 8     | 1024      | Adam      | exploration  | 1.5                   | contrastive   | Long desc   | 12            | D      |                    |
+| 1e-5  | 1e-8 | 32         | 8     | 1024      | Adam      | exploration  | 2.0                   | contrastive   | Long desc   | 13            | D      |                    |
+| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 14            | D      |                    |
+| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 16            | D      | loss maximize test |
 
 CLIP (Maximize)
 
-| LR    | Eps  | Batch size | Accum | Head size | Optimizer | Lr scheduler | lr_exploration_factor | Loss function | Description | Folder number | Status |
-|-------|------|------------|-------|-----------|-----------|--------------|-----------------------|---------------|-------------|---------------|--------|
-| 1e-6  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 2             | R      |
-| 1e-5  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 3             | R      |
-| 1e-4  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 4             | R      |
-| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 8             | R      |
+| LR    | Eps  | Batch size | Accum | Head size | Optimizer | Lr scheduler | lr_exploration_factor | Loss function | Description | Folder number | Status | Comment |
+|-------|------|------------|-------|-----------|-----------|--------------|-----------------------|---------------|-------------|---------------|--------|---------|
+| 1e-6  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 2             | R      |         |
+| 1e-5  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 3             | R      |         |
+| 1e-4  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 4             | R      |         |
+| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 8             | R      |         |
+| 1e-8  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 8             | R      |         |
+| 1e-5  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | supcon        | Word        | 14            | R      |         |
 
 CLIP (Minimize)
 
-| LR    | Eps  | Batch size | Accum | Head size | Optimizer | Lr scheduler | lr_exploration_factor | Loss function | Description | Folder number | Status |
-|-------|------|------------|-------|-----------|-----------|--------------|-----------------------|---------------|-------------|---------------|--------|
-| 1e-6  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 5             | R      |
-| 1e-5  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 6             | R      |
-| 1e-4  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 7             | R      |
-| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | Supcon        | Word        | 9             | R      |
+| LR    | Eps  | Batch size | Accum | Head size | Optimizer | Lr scheduler | lr_exploration_factor | Loss function | Description | Folder number | Status | Comment |
+|-------|------|------------|-------|-----------|-----------|--------------|-----------------------|---------------|-------------|---------------|--------|---------|
+| 1e-6  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 5             | R      |         |
+| 1e-5  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 6             | R      |         |
+| 1e-4  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 7             | R      |         |
+| 1e-10 | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | contrastive   | Word        | 9             | R      |         |
+| 1e-5  | 1e-8 | 16         | 4     | 1024      | Adam      | Cosine       | 1.5                   | supcon        | Word        | 15            | R      |         |

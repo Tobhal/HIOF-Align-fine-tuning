@@ -13,9 +13,10 @@
 
 # Execute the script
 python matrix.py \
-  --split_name fold_3_aug_square \
-  --nums 0 \
+  --split_name fold_0_aug_square \
+  --nums 5 \
   --heatmap \
-  --model_source "pretrained" \
-  --save_name "clip-fine-tune"
+  --checkpoint_name "best.pt" \
+  --save_name "align-fine-tune" \
+   --model_source "pretrained" \
   # --save_name "align-fine-tune"

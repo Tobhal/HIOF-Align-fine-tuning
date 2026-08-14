@@ -27,10 +27,9 @@ def compute_triplet_margin_loss(logits_per_image: Tensor, class_labels: Tensor, 
         if mask.any():
             positive_scores.append(logits_per_image[i][mask].max())
         else:
-            positive_scores.append(torch.tensor(0.0, device=logits_per_image.device))
+            positive_scores.append(logits_per_image.sum() * 0.0)
 
-    positive_pairs = torch.stack(positive_scores) if positive_scores else torch.tensor([0.0],
-                                                                                       device=logits_per_image.device)
+    positive_pairs = torch.stack(positive_scores) if positive_scores else (logits_per_image.sum() * 0.0).unsqueeze(0)
 
     # Negative pairs
     negative_mask = ~same_class_mask
@@ -71,10 +70,10 @@ labels: (B,) class labels
     # keep anchors that actually have at least 1 pos and 1 neg
     valid = torch.isfinite(hardest_pos) & torch.isfinite(hardest_neg)
     if not valid.any():
-        return torch.tensor(0.0, device=device)
+        return S.sum() * 0.0
 
     # similarity-based triplet: max(0, margin + s_neg - s_pos)
-    loss = F.relu(margin + hardest_neg[valid] - hardest_pos[valid]).mean()
+    loss = F.relu(margin + hardest_neg[valid] - hardest_pos[valid]).mean() * 10
     return loss
 
 
@@ -102,12 +101,12 @@ def compute_contrastive_loss(logits_per_image: Tensor, class_labels: Tensor, mar
 
     # Check if there are positive or negative scores and compute losses accordingly
     if positive_scores.numel() == 0:
-        positive_loss = torch.tensor(0.0, device=logits_per_image.device, dtype=logits_per_image.dtype)
+        positive_loss = logits_per_image.sum() * 0.0
     else:
         positive_loss = F.relu(1.0 - positive_scores).mean()
 
     if negative_scores.numel() == 0:
-        negative_loss = torch.tensor(0.0, device=logits_per_image.device, dtype=logits_per_image.dtype)
+        negative_loss = logits_per_image.sum() * 0.0
     else:
         negative_loss = F.relu(negative_scores - margin).mean()
 

@@ -7,7 +7,7 @@ def dataset_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     dataset_parser = parser.add_argument_group('Dataset arguments')
     # dataset_parser.add_argument('--data_config', type=str, default=ospj('configs', 'data', 'default.yaml'), help='Path to the data configuration file')
 
-    dataset_parser.add_argument('--name', choices=['clip-fine-tune', 'align-fine-tune'], default='clip-fine-tune', help='name of the experiment')
+    dataset_parser.add_argument('--name', choices=['clip-fine-tune', 'align-fine-tune'], default='align-fine-tune', help='name of the experiment')
 
     dataset_parser.add_argument('--data_dir', default='BengaliWords_CroppedVersion_Folds',
                                 help='local path to data root dir from ' + DATA_FOLDER)

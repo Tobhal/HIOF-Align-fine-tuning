@@ -99,6 +99,7 @@ def preprocess_align_batch(processor, images, texts):
         text=texts,
         return_tensors="pt",
         padding=True,
+
         # images_kwargs={
         #     "do_resize": False,
         #     "do_center_crop": False,
@@ -143,19 +144,40 @@ def unfreeze_top_text_layers(model, n_blocks=4):
                 p.requires_grad = True
 
 
-def build_optimizer_with_param_groups(model, lr_img=5e-5, lr_text=1e-5, wd=0.01):
-    img_params, txt_params = [], []
+def build_optimizer_with_param_groups_selected(model, args, lr_img=5e-5, lr_text=1e-5):
+    decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if n.startswith(("text_model", "text_projection")):
-            txt_params.append(p)
+        if n.endswith("bias") or "LayerNorm.weight" in n or "layer_norm.weight" in n:
+            no_decay.append((n, p))
         else:
-            img_params.append(p)
-    return torch.optim.AdamW(
-        [{"params": img_params, "lr": lr_img, "weight_decay": wd},
-         {"params": txt_params, "lr": lr_text, "weight_decay": wd}],
-        betas=(0.9, 0.98), eps=1e-8
+            decay.append((n, p))
+
+    def split_lr(named_params):
+        img, txt = [], []
+        for n, p in named_params:
+            (txt if n.startswith(("text_model", "text_projection")) else img).append(p)
+        return img, txt
+
+    img_d, txt_d = split_lr(decay)
+    img_nd, txt_nd = split_lr(no_decay)
+
+    param_groups = [
+        {"params": img_d,  "lr": lr_img,  "weight_decay": args.weight_decay},
+        {"params": txt_d,  "lr": lr_text, "weight_decay": args.weight_decay},
+        {"params": img_nd, "lr": lr_img,  "weight_decay": 0.0},
+        {"params": txt_nd, "lr": lr_text, "weight_decay": 0.0},
+    ]
+
+    return Lamb(
+        param_groups,
+        lr=lr_img,
+        weight_decay=args.weight_decay,
+        adam=(args.optimizer == "adam"),
+        maximize=args.maximize,
+        decouple_weight_decay=True,
+        fixed_decay=False,
     )
 
 
@@ -391,18 +413,19 @@ def train_epoch(
 
         outputs = model(**inputs)
 
-        if loss_func == 'triplet':
-            # loss = compute_triplet_margin_loss(outputs.logits_per_image, class_labels, margin)
-            loss = triplet_margin_from_similarity(outputs.logits_per_image, class_labels, margin)
-        elif loss_func == 'contrastive':
-            loss = compute_contrastive_loss(outputs.logits_per_image, class_labels, margin)
-        elif loss_func == 'simple':
-            loss = simple_loss(outputs.logits_per_image)
-        elif loss_func == 'supcon':
-            loss = supcon_infonce_from_logits(outputs.logits_per_image, outputs.logits_per_text,
-                                              class_labels, symmetric=True)
-        else:
-            raise ValueError('Invalid loss function')
+        with torch.cuda.amp.autocast():
+            if loss_func == 'triplet':
+                # loss = compute_triplet_margin_loss(outputs.logits_per_image, class_labels, margin)
+                loss = triplet_margin_from_similarity(outputs.logits_per_image, class_labels, margin)
+            elif loss_func == 'contrastive':
+                loss = compute_contrastive_loss(outputs.logits_per_image, class_labels, margin)
+            elif loss_func == 'simple':
+                loss = simple_loss(outputs.logits_per_image)
+            elif loss_func == 'supcon':
+                loss = supcon_infonce_from_logits(outputs.logits_per_image, outputs.logits_per_text,
+                                                  class_labels, symmetric=True)
+            else:
+                raise ValueError('Invalid loss function')
 
         # accumulate micro-batch losses for accurate logging
         micro_loss_accum += float(loss.item())
@@ -479,21 +502,22 @@ def validate_epoch(
             inputs = {k: v.to(device) for k, v in inputs.items()}
             outputs = model(**inputs)
 
-            # Loss
-            logits_per_image = outputs.logits_per_image
-            if loss_func == 'triplet':
-                loss = compute_triplet_margin_loss(logits_per_image, class_labels, margin)
-            elif loss_func == 'contrastive':
-                loss = compute_contrastive_loss(logits_per_image, class_labels, margin)
-            elif loss_func == 'simple':
-                loss = simple_loss(logits_per_image)
-            elif loss_func == 'supcon':
-                loss = supcon_infonce_from_logits(outputs.logits_per_image,
-                                                  outputs.logits_per_text,
-                                                  class_labels,
-                                                  symmetric=True)
-            else:
-                raise ValueError('Invalid loss function')
+            with torch.cuda.amp.autocast():
+                # Loss
+                logits_per_image = outputs.logits_per_image
+                if loss_func == 'triplet':
+                    loss = triplet_margin_from_similarity(logits_per_image, class_labels, margin)
+                elif loss_func == 'contrastive':
+                    loss = compute_contrastive_loss(logits_per_image, class_labels, margin)
+                elif loss_func == 'simple':
+                    loss = simple_loss(logits_per_image)
+                elif loss_func == 'supcon':
+                    loss = supcon_infonce_from_logits(outputs.logits_per_image,
+                                                      outputs.logits_per_text,
+                                                      class_labels,
+                                                      symmetric=True)
+                else:
+                    raise ValueError('Invalid loss function')
 
             total_loss += float(loss.item())
             num_batches += 1
@@ -541,6 +565,10 @@ def main(_args=None):
     validation_loader, _ = get_validation_loader(args, phosc_model)
     # test_loader, _ = get_test_loader(args, phosc_model)
 
+    # Add this to free GPU memory
+    del phosc_model
+    torch.cuda.empty_cache()
+
     image_loader = ImageLoader(ospj(DATA_FOLDER, args.data_dir, args.split_name))
 
     optimizer = None
@@ -556,8 +584,10 @@ def main(_args=None):
             align_model.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
-            adam=True if args.optimizer == 'adam' else False,
+            adam=(args.optimizer == "adam"),
             maximize=args.maximize,
+            decouple_weight_decay=True,
+            fixed_decay=False,
         )
     elif args.optimizer == 'none':
         optimizer = None
@@ -626,7 +656,7 @@ def main(_args=None):
 
     # before training
     freeze_text_tower(align_model)
-    optimizer = build_optimizer_with_param_groups(align_model, lr_img=5e-5, lr_text=1e-5, wd=args.weight_decay)
+    optimizer = build_optimizer_with_param_groups_selected(align_model, args, lr_img=args.lr, lr_text=args.lr)
 
     # (re)build LR scheduler to point at the *current* optimizer and to account for accumulation
     if args.lr_scheduler in {'cosine_warmup', 'linear'}:
@@ -655,11 +685,11 @@ def main(_args=None):
     else:
         lr_scheduler = None
 
-    warmup_epochs = 2  # keep text frozen at start
+    warmup_epochs = 5  # keep text frozen at start
     for epoch in range(start_epoch, args.epochs + 1):
         if epoch == warmup_epochs:
             unfreeze_top_text_layers(align_model, n_blocks=4)
-            optimizer = build_optimizer_with_param_groups(align_model, lr_img=5e-5, lr_text=1e-5, wd=args.weight_decay)
+            optimizer = build_optimizer_with_param_groups_selected(align_model, args, lr_img=args.lr, lr_text=args.lr)
 
             if args.lr_scheduler in {'cosine_warmup', 'linear'}:
                 lr_scheduler = make_accum_scheduler(

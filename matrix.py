@@ -57,9 +57,6 @@ from parser import (
 )
 
 
-# -----------------------
-# Globals / Preprocessing
-# -----------------------
 split = 'fold_0_t'
 use_augmented = False
 
@@ -101,9 +98,6 @@ Drops leftover rows/cols if N is not divisible by block.
     return X.squeeze(0).squeeze(0)  # [H', W']
 
 
-# -----------------------------
-# Heatmap saver (vectorized)
-# -----------------------------
 def save_heatmap(
         S: torch.Tensor,
         out_path: str,
@@ -183,9 +177,6 @@ Save a cosine-similarity heatmap for S (N x N), with crisp cells and small squar
     print(f"Heatmap saved at: {out_path}")
 
 
-# -----------------------
-# Data classes / results
-# -----------------------
 @dataclass
 class Result:
     model_number: int
@@ -194,9 +185,6 @@ class Result:
     average_value: float
 
 
-# -----------------------
-# I/O: save the matrix
-# -----------------------
 def save_matrix(matrix: torch.Tensor, results: Result, _model_save_path: PathLike, csv_filename="matrix"):
     """
 Save the given matrix as CSV and a small text summary next to it.
@@ -223,9 +211,6 @@ Save the given matrix as CSV and a small text summary next to it.
     print(f"Matrix saved at: {csv_path}")
 
 
-# ----------------------------------------
-# Cosine matrix helpers (vectorized & fast)
-# ----------------------------------------
 @torch.no_grad()
 def collect_image_features_align(
         model: nn.Module,
@@ -302,9 +287,6 @@ Compute N×N cosine similarity matrix from L2-normalized features [N, D].
     return feats @ feats.T  # [N, N], values in [-1, 1]
 
 
-# -----------------------------
-# (Optional) text embeddings
-# -----------------------------
 @torch.no_grad()
 def collect_text_features_align(
         model: nn.Module,
@@ -350,17 +332,11 @@ Encode a list of texts with CLIP, L2-normalize, return [N, D].
     return torch.cat(out, dim=0)
 
 
-# -----------------------
-# Pretty print results
-# -----------------------
 def print_results(results: List[Result]):
     for r in results:
         print(f"Model {r.model_number}: min={r.min_value:.6f}  max={r.max_value:.6f}  mean={r.average_value:.6f}")
 
 
-# -----------------------
-# Main
-# -----------------------
 def main(args=None, model=None, index=0) -> List[Result]:
     parser = argparse.ArgumentParser()
 
