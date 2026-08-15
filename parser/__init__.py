@@ -11,6 +11,9 @@ from .optimizer_argparse import optimizer_argparse
 from .prepear_data_argparse import prepear_data_argparse
 from .matrix_argparse import matrix_argparse
 from .matrix_new_argparse import matrix_new_argparse
+from .retrieval_metrics_argparse import retrieval_metrics_argparse
+from .qualitative_retrieval_argparse import qualitative_retrieval_argparse
+from .embedding_visualization_argparse import embedding_visualization_argparse
 from .plot_loss_argparse import plot_loss_argparse
 from .checkpoint_argparse import checkpoint_argparse
 from .slurm_argparse import slurm_argparse

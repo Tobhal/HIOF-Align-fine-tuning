@@ -1,0 +1,8 @@
+{
+  "model_family": "clip",
+  "model_dir": "saved_models/clip-fine-tune/fold_3_aug_square/8",
+  "n_queries": 10,
+  "off_diag_min": 0.9674285650253296,
+  "off_diag_mean": 0.9847329258918762,
+  "off_diag_max": 0.9956130385398865
+}

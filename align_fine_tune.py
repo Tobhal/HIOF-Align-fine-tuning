@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from os.path import join as ospj
 from typing import Callable, Tuple
@@ -373,7 +374,9 @@ def train_epoch(
         lr_scheduler: _LRScheduler = None,
         margin=1.0,
         accumulation_steps=4,
-        description='word'
+        description='word',
+        shuffle_descriptions=False,
+        image_executor: ThreadPoolExecutor = None,
 ):
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -385,7 +388,13 @@ def train_epoch(
 
     for i, batch in enumerate(train_loader):
         *_, image_names, _, words = batch
-        images = [image_loader(img_name) for img_name in image_names]
+        # PIL's JPEG decode releases the GIL, so a thread pool genuinely parallelizes
+        # this -- pure speed fix, loads the exact same images in whatever order they
+        # finish, then reassembles them in the original order. No effect on training.
+        if image_executor is not None:
+            images = list(image_executor.map(image_loader, image_names))
+        else:
+            images = [image_loader(img_name) for img_name in image_names]
 
         if description == 'word':
             descriptions = words
@@ -397,6 +406,15 @@ def train_epoch(
             descriptions = [get_phosc_description(w) for w in words]
         else:
             raise ValueError('Invalid description')
+
+        if shuffle_descriptions:
+            # Negative control: break the image<->text correspondence by randomly
+            # permuting the description strings within this batch. Images/words keep
+            # their original order and class labels; only which description string
+            # ends up paired with which image changes. The text side still sees the
+            # exact same real PHOSC prompts, just mismatched.
+            descriptions = list(descriptions)
+            random.shuffle(descriptions)
 
         # one-off example file
         example_path = ospj(save_path, 'description_example.txt')
@@ -461,7 +479,9 @@ def validate_epoch(
         save_path: str,
         margin=1.0,
         description='word',
+        shuffle_descriptions=False,
         use_amp: bool = False,  # optional speedup
+        image_executor: ThreadPoolExecutor = None,
 ):
     model.eval()
     model.to(device)
@@ -478,8 +498,12 @@ def validate_epoch(
         for batch in val_loader:
             *_, image_names, _, words = batch
 
-            # Build images + descriptions
-            images = [image_loader(img_name) for img_name in image_names]
+            # Build images + descriptions (see train_epoch: thread pool is a pure
+            # speed fix, same images, same order, just loaded in parallel)
+            if image_executor is not None:
+                images = list(image_executor.map(image_loader, image_names))
+            else:
+                images = [image_loader(img_name) for img_name in image_names]
 
             if description == 'word':
                 descriptions = words
@@ -491,6 +515,12 @@ def validate_epoch(
                 descriptions = [get_phosc_description(w) for w in words]
             else:
                 raise ValueError('Invalid description')
+
+            if shuffle_descriptions:
+                # Same negative control as train_epoch: keep images/words/labels as-is,
+                # only permute which description string is paired with which image.
+                descriptions = list(descriptions)
+                random.shuffle(descriptions)
 
             # Deterministic label mapping (avoid unordered set)
             uniq = sorted(set(words))
@@ -570,6 +600,11 @@ def main(_args=None):
     torch.cuda.empty_cache()
 
     image_loader = ImageLoader(ospj(DATA_FOLDER, args.data_dir, args.split_name))
+
+    # Pure speed fix: parallelize the per-batch PIL image loading (see train_epoch's
+    # comment). Off by default (--workers 0) to keep existing behavior unchanged
+    # unless explicitly requested.
+    image_executor = ThreadPoolExecutor(max_workers=args.workers) if args.workers and args.workers > 0 else None
 
     optimizer = None
     lr_scheduler = None
@@ -728,6 +763,8 @@ def main(_args=None):
             margin=args.margin,
             accumulation_steps=args.accumulation_steps,
             description=args.description,
+            shuffle_descriptions=args.shuffle_descriptions,
+            image_executor=image_executor,
             save_path=early_stopping.save_path,
         )
 
@@ -743,6 +780,8 @@ def main(_args=None):
                 loss_func=args.loss_func,
                 margin=args.margin,
                 description=args.description,
+                shuffle_descriptions=args.shuffle_descriptions,
+                image_executor=image_executor,
                 save_path=early_stopping.save_path,
             )
 

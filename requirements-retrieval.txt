@@ -1,0 +1,35 @@
+# Dependencies for retrieval_metrics_report.py and align_fine_tune.py (and the rest
+# of the ALIGN/CLIP fine-tuning + evaluation scripts they import transitively).
+#
+# torch/torchvision are NOT listed below -- install them separately, pinned to a CUDA
+# build the cluster's GPU driver actually supports (see next paragraph), *before*
+# installing this file. transformers>=5 requires torch>=2.5.
+#
+# On this cluster (driver 535.309.01, "CUDA Version: 12.2" per nvidia-smi): plain
+# `pip install torch` grabs whatever is newest on PyPI (currently CUDA 13 wheels),
+# which fails at runtime with "NVIDIA driver on your system is too old". torch>=2.5
+# under the cu121/cu124 wheel index also failed to install here because that specific
+# archived release pins an nvidia-cudnn-cu12 patch version PyPI has since pulled.
+# torch 2.6.0 under the cu126 index installs cleanly and DOES run on this driver
+# (CUDA's minor-version compatibility covers this) -- verified with a real matmul on
+# both GPUs on this node. If you're on a different machine/driver, adjust accordingly.
+#
+# Install with:
+#   python -m venv .venv
+#   ./.venv/bin/pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu126
+#   ./.venv/bin/pip install -r requirements-retrieval.txt
+#   ./.venv/bin/pip install git+https://github.com/openai/CLIP.git
+
+transformers
+pandas
+numpy
+toml
+tqdm
+pillow
+timm
+num2words
+pyyaml
+opencv-python-headless  # -headless: no libGL needed, this is a headless cluster script
+pynvml  # GPU memory logging in align_fine_tune.py
+matplotlib  # qualitative_retrieval.py, embedding_visualization.py
+scikit-learn  # embedding_visualization.py (t-SNE)

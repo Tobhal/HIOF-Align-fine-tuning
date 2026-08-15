@@ -1,0 +1,3 @@
+model,intra_class_mean,inter_class_mean,separation_margin
+frozen ALIGN (pretrained),0.7913507223129272,0.7281399369239807,0.06321078538894653
+fine-tuned ALIGN (run 4),0.5616989135742188,0.2446104884147644,0.31708842515945435

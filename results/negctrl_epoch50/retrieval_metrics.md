@@ -1,0 +1,5 @@
+| model_family | run_number | description_mode | loss_func | optimizer | lr_scheduler | lr | batch_size | accumulation_steps | effective_batch_size | augmented | n_test_images | n_text_queries | qbs_mAP | qbs_Recall@1 | qbs_Recall@5 | qbs_Recall@10 | qbe_mAP | qbe_Recall@1 | qbe_Recall@5 | qbe_Recall@10 | model_dir |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ALIGN | 4 | description | supcon | adam | cosine_warmup | 0.0000 | 8 | 16 | 128 | True | 380 | 380 | 0.0582 | 0.0026 | 0.0132 | 0.0289 | 0.4302 | 0.0984 | 0.2848 | 0.3967 | saved_models/align-fine-tune/fold_3_aug_square/4 |
+| ALIGN | 6 | description | supcon | adam | cosine_warmup | 0.0000 | 8 | 16 | 128 | True | 380 | 380 | 0.0445 | 0.0026 | 0.0132 | 0.0263 | 0.1466 | 0.0421 | 0.1148 | 0.1586 | saved_models/align-fine-tune/fold_3_aug_square/6 |
+| ALIGN | 7 | description | supcon | adam | cosine_warmup | 0.0000 | 8 | 16 | 128 | True | 380 | 380 | 0.0468 | 0.0026 | 0.0132 | 0.0263 | 0.1412 | 0.0414 | 0.1082 | 0.1536 | saved_models/align-fine-tune/fold_3_aug_square/7 |
